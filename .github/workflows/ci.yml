@@ -33,6 +33,75 @@ jobs:
           files: coverage.xml
           fail_ci_if_error: false
 
+  quality:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      SENTRUX_VERSION: v0.5.7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Cache Sentrux
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/bin/sentrux
+            ~/.local/bin/sentrux
+            ~/.sentrux/plugins
+          key: sentrux-${{ env.SENTRUX_VERSION }}-standard-plugins
+      - name: Install Sentrux
+        run: ./scripts/sentrux-check.sh --install-only 2>&1 || true
+      - name: Save baseline from base branch
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          git checkout ${{ github.event.pull_request.base.sha }}
+          sentrux gate --save . 2>&1 | tee sentrux-baseline.txt || true
+          git checkout ${{ github.sha }}
+      - name: Run Sentrux diff (gate)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: sentrux gate . 2>&1 | tee sentrux-diff.txt || true
+      - name: Run Sentrux absolute check
+        continue-on-error: true
+        run: sentrux check . 2>&1 | tee sentrux-output.txt
+      - name: Post Sentrux results as PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "<!-- sentrux-report -->"
+            echo "## Sentrux Quality Report"
+            echo ""
+            echo "### Absolute"
+            echo '```'
+            cat sentrux-output.txt
+            echo '```'
+            echo ""
+            echo "### Diff (vs base branch)"
+            echo '```'
+            if [ -f sentrux-diff.txt ]; then
+              cat sentrux-diff.txt
+            else
+              echo "No diff available"
+            fi
+            echo '```'
+          } > comment-body.txt
+
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            --jq '.[] | select(.body | startswith("<!-- sentrux-report -->")) | .id' | head -1)
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
+              -X PATCH -f body="$(cat comment-body.txt)"
+          else
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file comment-body.txt
+          fi
+
   lint:
     runs-on: ubuntu-latest
     steps:

@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,41 @@ if TYPE_CHECKING:
     from factory.runners.protocol import RunnerMeta
 
 log = structlog.get_logger()
+
+
+def _make_ceo_message_emitter(project_path: Path) -> Callable[[bytes], None]:
+    """Return a callback that emits ceo.message events for assistant JSONL lines."""
+    from factory.events import emit_event
+
+    def _on_line(line: bytes) -> None:
+        try:
+            parsed = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            return
+        if not isinstance(parsed, dict) or parsed.get("type") != "assistant":
+            return
+        message = parsed.get("message", "")
+        if isinstance(message, str):
+            text = message
+        elif isinstance(message, dict):
+            content = message.get("content", [])
+            text = "".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        else:
+            return
+        if not text:
+            return
+        emit_event(
+            project_path,
+            "ceo.message",
+            agent="ceo",
+            data={"message": text, "message_type": "assistant"},
+        )
+
+    return _on_line
 
 
 def _parse_usage(data: dict) -> AgentUsage:
@@ -67,7 +103,8 @@ class ClaudeRunner:
         cmd = [
             "claude", "--append-system-prompt-file", prompt_file.name,
             "-p", request.task,
-            "--output-format", "json",
+            "--output-format", "stream-json",
+            "--verbose",
         ]
         if request.skip_permissions:
             cmd.append("--dangerously-skip-permissions")
@@ -88,7 +125,7 @@ class ClaudeRunner:
 
         background = request.extras.get("background", False)
         if background:
-            from factory.runners._tmux_persist import run_in_background
+            from factory.runners._background import run_in_background
 
             stdout, rc, usage = await run_in_background(
                 request.prompt, request.task, request.cwd, request.role,
@@ -116,27 +153,42 @@ class ClaudeRunner:
         try:
             log.info("claude_headless", cwd=str(request.cwd), model=request.model)
 
+            on_line = None
+            if request.role == "ceo" and request.project_path is not None:
+                on_line = _make_ceo_message_emitter(request.project_path)
+
             result = await run_subprocess(
                 cmd, cwd=str(request.cwd), env=env,
                 timeout=request.timeout, runner_name="claude", role=request.role,
+                on_line=on_line,
             )
 
             usage = None
             result_text = result.stdout
             metadata: dict[str, object] = {**result.metadata}
-            try:
-                data = json.loads(result.stdout)
-                if isinstance(data, dict):
-                    result_value = data.get("result", result.stdout)
-                    result_text = result_value if isinstance(result_value, str) else result.stdout
-                    usage = _parse_usage(data)
-                    for key in ("session_id", "uuid", "stop_reason", "terminal_reason",
-                                "duration_api_ms", "ttft_ms", "is_error", "subtype"):
-                        metadata[key] = data.get(key)
-                    metadata["model_usage"] = data.get("modelUsage")
-                    metadata["permission_denials"] = data.get("permission_denials")
-            except (json.JSONDecodeError, ValueError):
-                log.debug("claude_json_parse_failed")
+
+            data: dict[str, object] | None = None
+            for line in reversed(result.stdout.strip().splitlines()):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(parsed, dict) and "result" in parsed:
+                    data = parsed
+                    break
+
+            if data is not None:
+                result_value = data.get("result", result.stdout)
+                result_text = result_value if isinstance(result_value, str) else result.stdout
+                usage = _parse_usage(data)
+                for key in ("session_id", "uuid", "stop_reason", "terminal_reason",
+                            "duration_api_ms", "ttft_ms", "is_error", "subtype"):
+                    metadata[key] = data.get(key)
+                metadata["model_usage"] = data.get("modelUsage")
+                metadata["permission_denials"] = data.get("permission_denials")
 
             return AgentRunResult(
                 stdout=result_text,
