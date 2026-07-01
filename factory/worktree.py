@@ -10,23 +10,49 @@ import structlog
 log = structlog.get_logger()
 
 
-def create_worktree(project_path: Path, base_branch: str = "main") -> tuple[Path, str]:
+def create_worktree(
+    project_path: Path,
+    base_branch: str = "main",
+    run_id: str | None = None,
+) -> tuple[Path, str]:
     """Create an isolated worktree for a factory run.
+
+    Args:
+        project_path: Path to the project root.
+        base_branch: Branch to create the worktree from.
+        run_id: Optional run identifier. If provided, uses the first 8 chars.
+                If None, generates a random 8-char hex ID.
 
     Returns (worktree_path, branch_name).
     """
     project_path = project_path.resolve()
-    run_id = secrets.token_hex(4)
+
+    # Resolve symbolic refs (HEAD, branch names) to commit SHAs so the
+    # worktree always branches from a deterministic point — critical when
+    # HEAD was just amended (e.g. FeatureBench mask-patch scenario).
+    result = subprocess.run(
+        ["git", "rev-parse", base_branch],
+        cwd=project_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    base_commit = result.stdout.strip()
+
+    if run_id is not None:
+        run_id = run_id[:8]
+    else:
+        run_id = secrets.token_hex(4)
     branch = f"factory/run-{run_id}"
     factory_dir = project_path / ".factory"
     wt_parent = project_path / ".factory-worktrees"
     wt_dir = wt_parent / f"run-{run_id}"
 
-    log.info("worktree_create", branch=branch, path=str(wt_dir))
+    log.info("worktree_create", branch=branch, base=base_commit[:12], path=str(wt_dir))
 
     wt_parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["git", "worktree", "add", str(wt_dir), "-b", branch, base_branch],
+        ["git", "worktree", "add", str(wt_dir), "-b", branch, base_commit],
         cwd=project_path,
         check=True,
         capture_output=True,
@@ -91,6 +117,8 @@ def remove_worktree(project_path: Path, worktree_path: Path, branch: str) -> Non
 def prune_stale(project_path: Path) -> list[str]:
     """Clean up stale worktrees from crashed runs. Returns list of pruned entries."""
     project_path = project_path.resolve()
+    if not project_path.exists():
+        return []
 
     result = subprocess.run(
         ["git", "worktree", "prune", "--verbose"],

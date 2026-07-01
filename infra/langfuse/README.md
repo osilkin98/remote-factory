@@ -1,76 +1,99 @@
-# LangFuse Local Development
+# Langfuse Local Development
 
-LangFuse provides LLM observability and tracing for the Red Hat Agents system.
+Langfuse provides LLM observability and tracing for the factory system.
 
-## Quick Start (Zero Configuration)
+## Quick Start
 
-**Tracing works automatically with no configuration.** Just start LangFuse:
-
+1. Start Langfuse services:
 ```bash
-# From project root
-scripts/langfuse start
+cd infra/langfuse && docker compose up -d
 ```
 
-That's it! The agents system automatically sends traces to LangFuse when it's running.
+2. Install the telemetry dependency group (one-time):
+```bash
+uv sync --extra telemetry
+```
 
-### How It Works
+3. Run the factory with Langfuse tracing enabled:
 
-The tracing module auto-detects LangFuse at `localhost:3000` using pre-configured development credentials that match the docker-compose setup. No environment variables, no `.env` files, no manual configuration needed.
+```bash
+export LANGFUSE_HOST=http://localhost:3000
+export LANGFUSE_BASE_URL=http://localhost:3000
+export LANGFUSE_PUBLIC_KEY=<your-public-key>
+export LANGFUSE_SECRET_KEY=<your-secret-key>
+export TELEMETRY_PLATFORM=langfuse
 
-| Component | Default | Notes |
+factory ceo /path/to/project
+```
+
+3. Open `http://localhost:3000` to view traces. Login: `dev@localhost.local` / `devpassword123`
+
+**Note:** `scripts/langfuse-setup start` auto-creates a `.env.local` file with these credentials. The factory CLI auto-loads it on startup — no manual export needed.
+
+If you need to create it manually, the file should look like:
+
+```
+LANGFUSE_HOST=http://localhost:3000
+LANGFUSE_BASE_URL=http://localhost:3000
+LANGFUSE_PUBLIC_KEY=<your-public-key>
+LANGFUSE_SECRET_KEY=<your-secret-key>
+TELEMETRY_PLATFORM=langfuse
+```
+
+For local dev, `scripts/langfuse-setup start` fills in the correct keys automatically.
+
+To persist across sessions, add the `export` versions to `~/.bashrc` or `~/.zshrc`.
+
+The factory creates a single Langfuse trace per CEO cycle. The trace structure:
+
+```
+Trace: factory:<project>/<mode>
+└── Root span (cycle session)
+    ├── agent:ceo          ← interactive CEO session (streamed in real-time)
+    │   ├── tool:Bash
+    │   ├── assistant_message
+    │   └── ...
+    ├── agent:researcher   ← headless specialist (transcript ingested on completion)
+    ├── agent:strategist
+    ├── agent:builder
+    └── agent:qa
+```
+
+- **CEO session** is traced incrementally via a background thread that tails the Claude Code transcript JSONL every 5 seconds. The span exists from session start, so partial data is visible even if the session is killed.
+- **Specialist agents** have their transcripts batch-ingested when the agent completes.
+- The trace name (`factory:<project>/<mode>`) is reasserted via the ingestion API to prevent the SDK from overwriting it with child observation names.
+
+### Environment Variables
+
+| Variable | Default | Notes |
 |-----------|---------|-------|
-| Host | `http://localhost:3000` | Auto-detected |
-| Public Key | `pk-lf-dev-local-key` | Matches docker-compose |
-| Secret Key | `sk-lf-dev-local-key` | Matches docker-compose |
+| `LANGFUSE_HOST` | — | Required. Set to `http://localhost:3000` for local dev |
+| `LANGFUSE_BASE_URL` | — | Same as HOST (some SDK versions use this) |
+| `LANGFUSE_PUBLIC_KEY` | — | Set by `scripts/langfuse-setup start` (see `.env.local`) |
+| `LANGFUSE_SECRET_KEY` | — | Set by `scripts/langfuse-setup start` (see `.env.local`) |
+| `TELEMETRY_PLATFORM` | — | Set to `langfuse` to enable |
 
-### Viewing Traces
+### Verifying Traces
 
-1. Start LangFuse: `scripts/langfuse start`
-2. Run a query: `./analyze "What is Red Hat's Q2 revenue?"`
-3. Open browser: `scripts/langfuse open --traces`
-4. Login: `dev@localhost.local` / `devpassword123`
-
-Use `--trace-id` to tag queries for easy searching:
 ```bash
-./analyze --trace-id my-test "What is Red Hat's Q2 revenue?"
-# Search by "Session ID" in LangFuse UI to find it
+python scripts/verify_langfuse_trace.py <project-name> [--after TIMESTAMP]
 ```
+
+This checks: single trace exists, correct name format, root span, agent spans nested under root, CEO span present, transcript observations ingested.
 
 ## CLI Commands
 
 All commands run from the **project root** directory:
 
 ```bash
-scripts/langfuse <command> [options]
-
-Commands:
-  start       Start LangFuse services
-  stop        Stop LangFuse services
-  status      Check service health and trace count
-  logs        View service logs
-  open        Open LangFuse UI in browser
-  reset       Delete all traces
-  config      Show configuration
-  setup-llm   Set up LLM for evaluations (optional)
-```
-
-Common examples:
-```bash
-scripts/langfuse start              # Start services
-scripts/langfuse status             # Check health
-scripts/langfuse stop               # Stop (preserve data)
-scripts/langfuse stop --volumes     # Stop and delete all data
-scripts/langfuse logs -f            # Stream all logs
-scripts/langfuse open               # Open browser
+scripts/langfuse-setup start    # Start LangFuse services
+scripts/langfuse-setup stop     # Stop services
+scripts/langfuse-setup status   # Show status and credentials
 ```
 
 ## Requirements
 
-- **Podman** (recommended) or **Docker**
-  - macOS: `brew install podman`
-  - Fedora: `dnf install podman`
-- **podman-compose** (if using Podman)
-  - `pip install podman-compose`
+- **Docker** or **Podman** — any of `docker compose`, `docker-compose`, or `podman-compose` works
 
 ## Disabling Tracing
 
@@ -108,7 +131,7 @@ Get a free API key from [Google AI Studio](https://aistudio.google.com/apikey):
 export GOOGLE_API_KEY=your-api-key
 
 # 2. Configure LangFuse
-scripts/langfuse setup-llm --adapter google-ai-studio
+scripts/langfuse-setup setup-llm --adapter google-ai-studio
 ```
 
 Available models: `gemini-3.1-pro-preview`, `gemini-3-flash-preview`
@@ -118,25 +141,25 @@ Available models: `gemini-3.1-pro-preview`, `gemini-3-flash-preview`
 ```bash
 # OpenAI
 export OPENAI_API_KEY=sk-xxx
-scripts/langfuse setup-llm --adapter openai
+scripts/langfuse-setup setup-llm --adapter openai
 
 # Anthropic
 export ANTHROPIC_API_KEY=sk-ant-xxx
-scripts/langfuse setup-llm --adapter anthropic
+scripts/langfuse-setup setup-llm --adapter anthropic
 ```
 
 ### Managing LLM Connections
 
 ```bash
-scripts/langfuse setup-llm --list     # List connections
-scripts/langfuse setup-llm --delete   # Delete all
-scripts/langfuse setup-llm --force    # Update existing
+scripts/langfuse-setup setup-llm --list     # List connections
+scripts/langfuse-setup setup-llm --delete   # Delete all
+scripts/langfuse-setup setup-llm --force    # Update existing
 ```
 
 ### Setting Default Model
 
 After creating a connection, set the default in the UI:
-1. `scripts/langfuse open`
+1. `scripts/langfuse-setup status`
 2. **Project Settings** > **Evaluators** > **+ Set up Evaluator**
 3. Select model (e.g., `gemini-3.1-pro-preview`)
 
@@ -164,12 +187,13 @@ podman machine start
 
 ### Containers failing to start
 ```bash
-scripts/langfuse logs --service web
-scripts/langfuse logs --service worker
+cd infra/langfuse && docker compose logs web
+cd infra/langfuse && docker compose logs worker
 ```
 
 ### Reset everything
 ```bash
-scripts/langfuse stop --volumes
-scripts/langfuse start
+scripts/langfuse-setup stop
+cd infra/langfuse && docker compose down --volumes
+scripts/langfuse-setup start
 ```

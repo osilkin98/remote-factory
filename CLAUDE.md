@@ -37,23 +37,35 @@ mypy factory/                    # Type check
 - Async/await by default — library functions in `store.py` and `eval/runner.py` are async, the CLI wraps them with `asyncio.run()`
 - Structured logging via `structlog` — use `log = structlog.get_logger()` at module level
 
-## Architecture (v2 — CEO Agent)
+## Architecture (v2 — CEO Agent + Workflow Graph Engine)
 
-The factory is a **three-layer system** with a dedicated CEO agent as the orchestrator:
+The factory is a **four-layer system**:
 
 ### Layer 1: Python CLI (`factory/`)
 
 Pure tools that don't make decisions. Entry point is `factory/cli.py` → `factory.cli:main` (registered as `factory` script in pyproject.toml). Each subcommand is a `cmd_*` function dispatched via a handler dict. Key modules include `factory/clean_pr.py` (Clean PR Mode — strips non-essential artifacts from PRs before pushing to external repos).
 
-### Layer 2: CEO Agent (`factory/agents/prompts/ceo.md`)
+### Layer 2: Workflow Graph Engine (`factory/workflow/`)
 
-A dedicated Claude Code agent that owns the full factory workflow. Spawned via `factory ceo /path` or `factory run /path`. The CEO detects project state, routes to modes (Build/Discover/Review/Improve/Research/Design/Meta), spawns specialist agents, makes keep/revert decisions, and ensures mandatory archival. SKILL.md is a thin launcher shim that spawns the CEO.
+All 8 factory modes (build, design, improve, research, meta, discover, review, refine) are defined as directed graphs of typed nodes in `factory/workflow/definitions.py`. Each graph is a `Workflow` Pydantic model with `AgentNode`, `FnNode`, `GateNode`, `ForkNode`, `JoinNode`, and `Study` primitives connected by `Edge` objects. See `factory/workflow/README.md` for full documentation.
 
-### Layer 3: Specialist Agents (`factory/agents/`)
+The same graph definition produces two execution formats:
+- **Headless:** `WorkflowExecutor` (`factory/workflow/executor.py`) walks the DAG deterministically — `factory workflow run <name> --project /path`
+- **Interactive:** `skill_export.py` converts graphs to Claude Code `SKILL.md` files under `skills/workflow-*/` — the CEO agent reads these at runtime as mode-specific playbooks
 
-Seven specialist Claude Code subprocesses spawned by the CEO via `factory agent <role>`. Agent prompts are resolved via `factory/agents/runner.py` with a two-tier lookup: project-specific override (`.factory/agents/<role>.md`) then factory default (`factory/agents/prompts/<role>.md`). Evolved playbooks from `~/.factory/playbooks/<role>.md` (user-local, ACE-generated) are auto-injected, falling back to factory defaults in `factory/agents/playbooks/<role>.md`.
+### Layer 3: CEO Agent (`factory/agents/prompts/ceo.md` + `skills/workflow-*/SKILL.md`)
 
-**Roles:** Researcher (observe), Strategist (hypothesize and refine ideas), Builder (implement), QA (health check + code review + adversarial QA), Archivist (record), Refiner (scope refinements), CEO (orchestrate).
+The CEO prompt is split into two parts:
+- **`ceo.md` (501 lines)** — core identity, cross-cutting rules (Sacred Rules, FEEC, keep/revert framework, review gates, error recovery, self-learning). No mode-specific procedures.
+- **`skills/workflow-*/SKILL.md` (8 files)** — each mode's full step-by-step playbook, auto-generated from the workflow graph definitions via `factory workflow export-skills`.
+
+Spawned via `factory ceo /path` or `factory run /path`. The CEO receives `ceo.md` as its system prompt, detects project state, then reads the appropriate `SKILL.md` into its context and follows it as the mode-specific playbook.
+
+### Layer 4: Specialist Agents (`factory/agents/`)
+
+Eight specialist Claude Code subprocesses spawned by the CEO via `factory agent <role>`. Agent prompts are resolved via `factory/agents/runner.py` with a two-tier lookup: project-specific override (`.factory/agents/<role>.md`) then factory default (`factory/agents/prompts/<role>.md`). Evolved playbooks from `~/.factory/playbooks/<role>.md` (user-local, ACE-generated) are auto-injected, falling back to factory defaults in `factory/agents/playbooks/<role>.md`.
+
+**Roles:** Researcher (observe), Strategist (hypothesize and refine ideas), Builder (implement), QA (health check + code review + adversarial QA), Archivist (record), Refiner (scope refinements), Failure Analyst (research mode), CEO (orchestrate).
 
 ### Key data flow
 
@@ -177,6 +189,7 @@ factory ceo "distributed eval runner" --mode design  # Brainstorm → build
 factory ceo /path/to/project --mode design           # Discuss what to work on → improve
 factory ceo /path/to/project --mode design --focus "auth"  # Discuss a specific topic
 factory ceo "SWE-bench solver" --mode research            # Research ideation → build
+factory ceo /path/to/factory --mode create --focus "mode description"  # Create a new factory mode
 
 # Improve — point at existing codebase
 factory ceo /path/to/project                    # Single improvement cycle
@@ -211,7 +224,7 @@ factory precheck /path --score-before 0.7 --score-after 0.85  # Hard precheck ga
 factory review --verdict KEEP --pr 42           # Post structured review on GitHub PR
 ```
 
-`factory run` / `factory ceo` spawn the CEO agent as a subprocess using the selected runner (`claude` by default, or `bob` with `--runner bob`). The CEO owns the full workflow: state detection, agent spawning, experiment lifecycle, and mandatory archival. The `--loop` flag adds a heartbeat wrapper with configurable interval and max cycles. `--mode meta` runs the full Improve loop on the factory itself, then ACE playbook evolution for all agent roles. `--focus` activates targeted mode: builds exactly one item and exits. Accepts backlog names (`--focus "eval reliability"`), issue numbers (`--focus 42`), issue URLs, or `owner/repo#N` shorthand. Issue refs are auto-detected and fetched via `gh`/`glab` CLI. Works in improve and research modes; mutually exclusive with `--loop`. `--mode design` enters ideation mode. For new ideas (e.g. `factory ceo "distributed eval runner" --mode design`), the CEO researches the space via the Researcher, then iteratively refines the idea with the Strategist through user feedback, producing a phased build plan before building. For existing projects (e.g. `factory ceo /path/to/project --mode design`), the CEO studies the project (backlog, eval scores, open issues, history), presents findings, and discusses what to work on before transitioning to Improve mode. `--mode interactive` is accepted as a backward-compatible alias for `--mode design`. `--focus` is allowed on existing projects to seed the discussion topic. Incompatible with `--headless`. `--mode research` enters research ideation for new projects (e.g. `factory ceo "SWE-bench solver" --mode research`) — the Strategist collects research config (target metric, mutable/fixed surfaces, constraints) before building. For existing projects with `research_target` configured, runs the research improvement loop directly. Incompatible with `--headless` (for new projects) and `--prompt`. `--refine "<request>"` enters refinement mode — routes a single change request through the Refiner → Builder → full review pipeline. Mutually exclusive with `--mode`, `--prompt`, and `--focus`. Requires an existing project directory. In foreground mode, the CEO also enters the refinement loop automatically after completing a build/improve cycle, staying active for follow-up requests without `--refine`.
+`factory run` / `factory ceo` spawn the CEO agent as a subprocess using the selected runner (`claude` by default, or `bob` with `--runner bob`). The CEO owns the full workflow: state detection, agent spawning, experiment lifecycle, and mandatory archival. The `--loop` flag adds a heartbeat wrapper with configurable interval and max cycles. `--mode meta` runs the full Improve loop on the factory itself, then ACE playbook evolution for all agent roles. `--focus` activates targeted mode: builds exactly one item and exits. Accepts backlog names (`--focus "eval reliability"`), issue numbers (`--focus 42`), issue URLs, or `owner/repo#N` shorthand. Issue refs are auto-detected and fetched via `gh`/`glab` CLI. Works in improve, research, and create modes; mutually exclusive with `--loop`. In create mode, `--focus` provides the mode description. `--mode design` enters ideation mode. For new ideas (e.g. `factory ceo "distributed eval runner" --mode design`), the CEO researches the space via the Researcher, then iteratively refines the idea with the Strategist through user feedback, producing a phased build plan before building. For existing projects (e.g. `factory ceo /path/to/project --mode design`), the CEO studies the project (backlog, eval scores, open issues, history), presents findings, and discusses what to work on before transitioning to Improve mode. `--mode interactive` is accepted as a backward-compatible alias for `--mode design`. `--focus` is allowed on existing projects to seed the discussion topic. Incompatible with `--headless`. `--mode research` enters research ideation for new projects (e.g. `factory ceo "SWE-bench solver" --mode research`) — the Strategist collects research config (target metric, mutable/fixed surfaces, constraints) before building. For existing projects with `research_target` configured, runs the research improvement loop directly. Incompatible with `--headless` (for new projects) and `--prompt`. `--refine "<request>"` enters refinement mode — routes a single change request through the Refiner → Builder → full review pipeline. Mutually exclusive with `--mode`, `--prompt`, and `--focus`. Requires an existing project directory. In foreground mode, the CEO also enters the refinement loop automatically after completing a build/improve cycle, staying active for follow-up requests without `--refine`.
 
 ## Observability
 

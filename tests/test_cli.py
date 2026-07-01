@@ -33,7 +33,7 @@ def _mock_foreground():
     mock_run = MagicMock(return_value=MagicMock(returncode=0))
     with patch("factory.runners.claude.subprocess.run", mock_run), \
          patch("factory.worktree.create_worktree",
-               side_effect=lambda p, b="main": (p, "factory/run-test")), \
+               side_effect=lambda p, b="main", run_id=None: (p, "factory/run-test")), \
          patch("factory.worktree.remove_worktree"), \
          patch("factory.worktree.prune_stale", return_value=[]), \
          patch("factory.cli._read_target_branch", return_value="main"), \
@@ -215,23 +215,23 @@ class TestCmdCeoDesign:
         task = cmd[dsp_idx + 1]
         assert "distributed eval runner" in task
 
-    def test_design_existing_mode_is_build(self, tmp_path):
-        """--mode design on existing dir sets Mode: build in the CEO task."""
+    def test_design_existing_mode_is_design(self, tmp_path):
+        """--mode design on existing dir sets Mode: design in the CEO task."""
         with _mock_foreground() as mock_run:
             main(["ceo", str(tmp_path), "--mode", "design"])
         cmd = mock_run.call_args[0][0]
         dsp_idx = cmd.index("--dangerously-skip-permissions")
         task = cmd[dsp_idx + 1]
-        assert "Mode: build" in task
+        assert "Mode: design" in task
 
-    def test_design_new_idea_mode_is_build(self):
-        """--mode design with new idea sets Mode: build in the CEO task."""
+    def test_design_new_idea_mode_is_ideation(self):
+        """--mode design with new idea sets Mode: ideation in the CEO task."""
         with _mock_foreground() as mock_run:
             main(["ceo", "weather CLI", "--mode", "design"])
         cmd = mock_run.call_args[0][0]
         dsp_idx = cmd.index("--dangerously-skip-permissions")
         task = cmd[dsp_idx + 1]
-        assert "Mode: build" in task
+        assert "Mode: ideation" in task
 
     def test_interactive_backward_compat_alias(self, tmp_path):
         """--mode interactive is accepted as a backward-compatible alias for design."""
@@ -352,14 +352,14 @@ class TestCmdCeoResearchIdeation:
         assert "## Plan Loop (Interactive)" in task
         assert "swe-bench solver agent" in task
 
-    def test_research_ideation_task_mode_is_build(self):
-        """--mode research with idea sets Mode: build (not research) since it enters ideation first."""
+    def test_research_ideation_task_mode_is_ideation(self):
+        """--mode research with idea sets Mode: ideation (not build) since it enters ideation first."""
         with _mock_foreground() as mock_run:
             main(["ceo", "swe-bench solver agent", "--mode", "research"])
         cmd = mock_run.call_args[0][0]
         dsp_idx = cmd.index("--dangerously-skip-permissions")
         task = cmd[dsp_idx + 1]
-        assert "Mode: build" in task
+        assert "Mode: ideation" in task
 
     def test_research_ideation_uses_plan_loop_not_design(self):
         """--mode research should use Plan Loop, not a separate Design Mode block."""
@@ -1026,8 +1026,15 @@ class TestCmdCeoReview:
         task = mock_agent.call_args[0][1]
         assert "Mode: review" in task
         assert "PR #42" in task
-        assert "gh pr diff 42" in task
-        assert "gh pr view 42" in task
+        assert "review-only run" in task
+        assert "no Builder iterations" in task
+        assert "factory eval" in task
+        assert "step 2c-qa" in task
+        assert "iteration 1/1" in task
+        assert "step 2d" in task
+        assert "--reason" in task
+        assert "--qa-body-file" in task
+        assert "factory review --verdict" in task
 
     def test_review_mode_headless_with_repo(self, tmp_path, capsys):
         """--mode review --pr 42 --repo owner/repo includes repo in task."""
@@ -1038,6 +1045,7 @@ class TestCmdCeoReview:
         task = mock_agent.call_args[0][1]
         assert "owner/repo" in task
         assert "--repo owner/repo" in task
+        assert "factory review --verdict" in task
 
     def test_review_mode_skips_worktree(self, tmp_path):
         """Review mode does not create worktrees or touch experiment store."""
@@ -1064,6 +1072,71 @@ class TestCmdCeoReview:
         """Review mode uses max_respawns=1."""
         with patch("factory.agents.runner.invoke_agent", _mock_invoke_agent_ok()) as mock_agent:
             main(["ceo", str(tmp_path), "--mode", "review", "--pr", "42", "--headless"])
+        call_kwargs = mock_agent.call_args[1]
+        assert call_kwargs.get("timeout") == 7200.0
+
+
+class TestCmdCeoQa:
+    def test_qa_mode_without_pr_errors(self, capsys):
+        result = main(["ceo", "/some/path", "--mode", "qa"])
+        assert result == 1
+        assert "--pr" in capsys.readouterr().err
+
+    def test_qa_mode_nonexistent_path_errors(self, capsys):
+        result = main(["ceo", "/nonexistent/path", "--mode", "qa", "--pr", "42"])
+        assert result == 1
+        assert "existing directory" in capsys.readouterr().err
+
+    def test_qa_mode_headless_builds_correct_task(self, tmp_path, capsys):
+        """--mode qa --pr 42 --headless builds a qa task and invokes CEO."""
+        with patch("factory.agents.runner.invoke_agent", _mock_invoke_agent_ok()) as mock_agent:
+            result = main(["ceo", str(tmp_path), "--mode", "qa", "--pr", "42", "--headless"])
+        assert result == 0
+        mock_agent.assert_called_once()
+        task = mock_agent.call_args[0][1]
+        assert "Mode: qa" in task
+        assert "PR #42" in task
+        assert "factory review --verdict" in task
+        assert "--reason" in task
+        assert "--qa-body-file" in task
+        assert "workflow-qa SKILL.md" in task
+        assert "Do NOT post any PR comments" in task
+
+    def test_qa_mode_headless_with_repo(self, tmp_path, capsys):
+        """--mode qa --pr 42 --repo owner/repo includes repo in task."""
+        with patch("factory.agents.runner.invoke_agent", _mock_invoke_agent_ok()) as mock_agent:
+            result = main(["ceo", str(tmp_path), "--mode", "qa", "--pr", "42",
+                           "--repo", "owner/repo", "--headless"])
+        assert result == 0
+        task = mock_agent.call_args[0][1]
+        assert "owner/repo" in task
+        assert "--repo owner/repo" in task
+
+    def test_qa_mode_skips_worktree(self, tmp_path):
+        """QA mode does not create worktrees or touch experiment store."""
+        with patch("factory.agents.runner.invoke_agent", _mock_invoke_agent_ok()), \
+             patch("factory.worktree.create_worktree") as mock_wt:
+            main(["ceo", str(tmp_path), "--mode", "qa", "--pr", "42", "--headless"])
+        mock_wt.assert_not_called()
+
+    def test_qa_mode_foreground(self, tmp_path):
+        """QA mode without --headless launches interactively."""
+        mock_run = MagicMock(return_value=MagicMock(returncode=0))
+        with patch("factory.runners.claude.subprocess.run", mock_run), \
+             patch("factory.cli._ensure_dashboard"):
+            main(["ceo", str(tmp_path), "--mode", "qa", "--pr", "42"])
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == "claude"
+        dsp_idx = cmd.index("--dangerously-skip-permissions")
+        task = cmd[dsp_idx + 1]
+        assert "Mode: qa" in task
+        assert "PR #42" in task
+
+    def test_qa_mode_max_respawns_is_1(self, tmp_path):
+        """QA mode uses max_respawns=1."""
+        with patch("factory.agents.runner.invoke_agent", _mock_invoke_agent_ok()) as mock_agent:
+            main(["ceo", str(tmp_path), "--mode", "qa", "--pr", "42", "--headless"])
         call_kwargs = mock_agent.call_args[1]
         assert call_kwargs.get("timeout") == 7200.0
 
@@ -1456,10 +1529,50 @@ class TestBuildCeoTaskDesign:
         task = _build_ceo_task(tmp_path, "build", design_existing=True)
         assert "existing_project: true" in task
 
-    def test_existing_mode_is_build(self, tmp_path):
-        """When ceo_mode is build (as set by cli.py), task shows Mode: build."""
-        task = _build_ceo_task(tmp_path, "build", design_existing=True)
-        assert "Mode: build" in task
+    def test_existing_mode_shows_display_mode(self, tmp_path):
+        """When display_mode is provided, task shows it instead of internal mode."""
+        task = _build_ceo_task(tmp_path, "build", design_existing=True, display_mode="design")
+        assert "Mode: design" in task
+
+
+class TestCreateModeFocus:
+    """Tests for --focus working with --mode create (issue #832)."""
+
+    def test_focus_accepted_with_create_mode(self, tmp_path):
+        """--focus is no longer rejected when --mode create is set."""
+        (tmp_path / ".git").mkdir()
+        with _mock_foreground() as mock_run:
+            main(["ceo", str(tmp_path), "--mode", "create", "--focus", "a PR validation mode"])
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        dsp_idx = cmd.index("--dangerously-skip-permissions")
+        task = cmd[dsp_idx + 1]
+        assert "## Create Mode (New Factory Mode)" in task
+        assert "a PR validation mode" in task
+
+    def test_create_mode_without_focus(self, tmp_path):
+        """--mode create without --focus still works (create_description is None)."""
+        (tmp_path / ".git").mkdir()
+        with _mock_foreground() as mock_run:
+            main(["ceo", str(tmp_path), "--mode", "create"])
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        dsp_idx = cmd.index("--dangerously-skip-permissions")
+        task = cmd[dsp_idx + 1]
+        assert "## Create Mode (New Factory Mode)" not in task
+
+    def test_build_ceo_task_create_description(self, tmp_path):
+        """_build_ceo_task emits the Create Mode section when create_description is provided."""
+        task = _build_ceo_task(tmp_path, "build", create_description="a mode for validating PRs")
+        assert "## Create Mode (New Factory Mode)" in task
+        assert "a mode for validating PRs" in task
+        assert "Mode description from user" in task
+        assert "## Focus Directive" not in task
+
+    def test_build_ceo_task_no_create_description(self, tmp_path):
+        """_build_ceo_task omits the Create Mode section when create_description is None."""
+        task = _build_ceo_task(tmp_path, "build", create_description=None)
+        assert "## Create Mode (New Factory Mode)" not in task
 
 
 class TestProfileParser:
@@ -1553,7 +1666,7 @@ class TestCmdHomeReturnsFactoryDir:
 
 class TestCmdTmuxBareCLI:
     def test_tmux_command_uses_bare_factory(self):
-        """cmd_tmux generates a shell command using bare 'factory run', not uv run."""
+        """cmd_tmux generates a shell command using bare 'factory ceo', not uv run."""
         from factory.cli import cmd_tmux
         import argparse
 
@@ -1582,7 +1695,7 @@ class TestCmdTmuxBareCLI:
 
             new_session_call = mock_run.call_args_list[1]
             shell_cmd = new_session_call[0][0][-1]  # last arg is the shell command
-            assert "factory run" in shell_cmd
+            assert "factory ceo" in shell_cmd
             assert "uv run python -m factory" not in shell_cmd
             assert "cd " not in shell_cmd
             assert "source .venv/bin/activate" not in shell_cmd
