@@ -14,9 +14,9 @@ jobs:
     if: >-
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '@ceo-review') &&
-      contains(fromJSON('["akashgit", "xukai92", "colehurwitz", "shivchander", "osilkin98", "gx-ai-architect"]'), github.event.comment.user.login)
+      contains(fromJSON('["akashgit", "xukai92", "colehurwitz", "shivchander", "osilkin98", "gx-ai-architect", "RobotSail", "mihirathale98", "lukeinglis", "nehamalepati", "abhi1092", "s-akhtar-baig", "lambdabaa"]'), github.event.comment.user.login)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
 
     steps:
       - name: React with eyes
@@ -34,11 +34,18 @@ jobs:
         id: pr
         run: echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout PR merge ref
+      - name: Checkout default branch (trusted factory)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: factory-trusted
+
+      - name: Checkout PR merge ref (code under review)
         uses: actions/checkout@v4
         with:
           ref: refs/pull/${{ steps.pr.outputs.number }}/merge
           fetch-depth: 0
+          path: pr-code
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -49,7 +56,10 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Install factory
-        run: uv sync
+        working-directory: factory-trusted
+        run: |
+          uv sync --extra telemetry
+          uv tool install -e .
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -66,13 +76,18 @@ jobs:
           claude --version
 
       - name: Run CEO review
+        working-directory: factory-trusted
         env:
           CLAUDE_CODE_USE_VERTEX: "1"
           ANTHROPIC_VERTEX_PROJECT_ID: ${{ secrets.GCP_PROJECT }}
           CLOUD_ML_REGION: ${{ secrets.GCP_REGION }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FACTORY_MODEL: "claude-opus-4-6[1m]"
+          LANGFUSE_HOST: ${{ secrets.LANGFUSE_HOST }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
         run: |
-          uv run factory ceo . --mode review --pr ${{ steps.pr.outputs.number }} --headless
+          factory ceo ${{ github.workspace }}/pr-code --mode deep-qa --pr ${{ steps.pr.outputs.number }} --headless
 
       - name: Approve PR if verdict is KEEP
         if: success()

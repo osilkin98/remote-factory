@@ -1,11 +1,26 @@
 """Tests for factory/worktree.py — git worktree lifecycle management."""
 
+import json
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from factory.worktree import create_worktree, detect_default_branch, prune_stale, remove_worktree
+from factory.worktree import (
+    _SHARED_SYMLINK_ENTRIES,
+    _bootstrap_unborn_repo,
+    _has_active_sessions,
+    _is_unborn_repo,
+    _preserve_telemetry,
+    _seed_experiment_factory,
+    _sync_backlog_to_main,
+    create_experiment_worktree,
+    create_worktree,
+    detect_default_branch,
+    prune_stale,
+    remove_worktree,
+)
 
 pytestmark = pytest.mark.real_worktree
 
@@ -31,7 +46,10 @@ def git_project(tmp_path: Path) -> Path:
     subprocess.run(["git", "add", "."], cwd=project, capture_output=True, check=True)
     subprocess.run(
         ["git", "commit", "-m", "initial"],
-        cwd=project, capture_output=True, check=True, env=env,
+        cwd=project,
+        capture_output=True,
+        check=True,
+        env=env,
     )
 
     factory_dir = project / ".factory"
@@ -51,12 +69,20 @@ class TestCreateWorktree:
         assert branch.startswith("factory/run-")
         assert wt_path.parent == git_project / ".factory-worktrees"
 
-    def test_worktree_has_factory_symlink(self, git_project: Path) -> None:
+    def test_worktree_has_selective_factory(self, git_project: Path) -> None:
         wt_path, _ = create_worktree(git_project)
 
-        symlink = wt_path / ".factory"
-        assert symlink.is_symlink()
-        assert symlink.resolve() == (git_project / ".factory").resolve()
+        wt_factory = wt_path / ".factory"
+        assert wt_factory.is_dir()
+        assert not wt_factory.is_symlink()
+
+        assert (wt_factory / "config.json").is_symlink()
+        assert (wt_factory / "results.tsv").is_symlink()
+
+        for subdir in ("strategy", "reviews", "state"):
+            d = wt_factory / subdir
+            assert d.is_dir()
+            assert not d.is_symlink()
 
     def test_worktree_contains_project_files(self, git_project: Path) -> None:
         wt_path, _ = create_worktree(git_project)
@@ -69,7 +95,9 @@ class TestCreateWorktree:
 
         result = subprocess.run(
             ["git", "branch", "--show-current"],
-            cwd=wt_path, capture_output=True, text=True,
+            cwd=wt_path,
+            capture_output=True,
+            text=True,
         )
         assert result.stdout.strip() == branch
 
@@ -84,21 +112,48 @@ class TestCreateWorktree:
         }
         subprocess.run(
             ["git", "checkout", "-b", "develop"],
-            cwd=git_project, capture_output=True, check=True,
+            cwd=git_project,
+            capture_output=True,
+            check=True,
         )
         (git_project / "extra.txt").write_text("dev")
         subprocess.run(["git", "add", "."], cwd=git_project, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "dev commit"],
-            cwd=git_project, capture_output=True, check=True, env=env,
+            cwd=git_project,
+            capture_output=True,
+            check=True,
+            env=env,
         )
         subprocess.run(
             ["git", "checkout", "main"],
-            cwd=git_project, capture_output=True, check=True,
+            cwd=git_project,
+            capture_output=True,
+            check=True,
         )
 
         wt_path, _ = create_worktree(git_project, base_branch="develop")
         assert (wt_path / "extra.txt").exists()
+
+    def test_uses_provided_run_id(self, git_project: Path) -> None:
+        uuid_str = "d854881a-800d-44ff-beb5-b9fd77cc3fb9"
+        wt_path, branch = create_worktree(git_project, run_id=uuid_str)
+
+        # First 8 chars of UUID should be used
+        assert branch == "factory/run-d854881a"
+        assert wt_path.name == "run-d854881a"
+
+    def test_run_id_truncated_to_8_chars(self, git_project: Path) -> None:
+        wt_path, branch = create_worktree(git_project, run_id="abcdef1234567890")
+
+        assert branch == "factory/run-abcdef12"
+        assert wt_path.name == "run-abcdef12"
+
+    def test_short_run_id_used_as_is(self, git_project: Path) -> None:
+        wt_path, branch = create_worktree(git_project, run_id="abc")
+
+        assert branch == "factory/run-abc"
+        assert wt_path.name == "run-abc"
 
     def test_multiple_worktrees_coexist(self, git_project: Path) -> None:
         wt1, br1 = create_worktree(git_project)
@@ -121,7 +176,9 @@ class TestRemoveWorktree:
 
         result = subprocess.run(
             ["git", "branch", "--list", branch],
-            cwd=git_project, capture_output=True, text=True,
+            cwd=git_project,
+            capture_output=True,
+            text=True,
         )
         assert branch not in result.stdout
 
@@ -136,9 +193,38 @@ class TestRemoveWorktree:
 
         result = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
-            cwd=git_project, capture_output=True, text=True,
+            cwd=git_project,
+            capture_output=True,
+            text=True,
         )
         assert str(wt_path) not in result.stdout
+
+
+class TestTelemetryPreservation:
+    def test_trace_id_preserved_on_removal(self, git_project: Path) -> None:
+        """trace_id.txt in worktree's real .factory/ is copied to main at teardown."""
+        wt_path, branch = create_worktree(git_project)
+
+        trace_id = "test-trace-12345"
+        (wt_path / ".factory" / "trace_id.txt").write_text(trace_id)
+
+        main_trace = git_project / ".factory" / "trace_id.txt"
+        assert not main_trace.exists()
+
+        remove_worktree(git_project, wt_path, branch)
+
+        assert main_trace.exists()
+        assert main_trace.read_text() == trace_id
+
+    def test_no_trace_id_no_error(self, git_project: Path) -> None:
+        """Cleanup succeeds when trace_id.txt doesn't exist."""
+        wt_path, branch = create_worktree(git_project)
+
+        assert not (wt_path / ".factory" / "trace_id.txt").exists()
+
+        remove_worktree(git_project, wt_path, branch)
+
+        assert not wt_path.exists()
 
 
 class TestPruneStale:
@@ -173,6 +259,7 @@ class TestPruneStale:
         """Simulate a crash: create worktree, delete dir manually, then prune."""
         wt_path, branch = create_worktree(git_project)
         import shutil
+
         shutil.rmtree(wt_path)
 
         pruned = prune_stale(git_project)
@@ -180,7 +267,9 @@ class TestPruneStale:
 
         result = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
-            cwd=git_project, capture_output=True, text=True,
+            cwd=git_project,
+            capture_output=True,
+            text=True,
         )
         assert str(wt_path) not in result.stdout
 
@@ -206,7 +295,10 @@ def git_project_master(tmp_path: Path) -> Path:
     subprocess.run(["git", "add", "."], cwd=project, capture_output=True, check=True)
     subprocess.run(
         ["git", "commit", "-m", "initial"],
-        cwd=project, capture_output=True, check=True, env=env,
+        cwd=project,
+        capture_output=True,
+        check=True,
+        env=env,
     )
 
     factory_dir = project / ".factory"
@@ -244,13 +336,18 @@ class TestDetectDefaultBranch:
 
         subprocess.run(
             ["git", "init", "-b", "develop"],
-            cwd=project, capture_output=True, check=True,
+            cwd=project,
+            capture_output=True,
+            check=True,
         )
         (project / "README.md").write_text("hello")
         subprocess.run(["git", "add", "."], cwd=project, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "initial"],
-            cwd=project, capture_output=True, check=True, env=env,
+            cwd=project,
+            capture_output=True,
+            check=True,
+            env=env,
         )
 
         assert detect_default_branch(project) == "develop"
@@ -267,22 +364,190 @@ class TestCreateWorktreeWithMaster:
             remove_worktree(git_project_master, wt_path, branch)
 
 
+class TestSHAResolution:
+    def test_create_worktree_resolves_head(self, git_project: Path) -> None:
+        """create_worktree('HEAD') resolves to the current commit SHA."""
+        expected_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_project,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        wt_path, branch = create_worktree(git_project, "HEAD")
+
+        wt_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=wt_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        assert wt_sha == expected_sha
+
+    def test_create_worktree_resolves_amended_head(self, git_project: Path) -> None:
+        """After an amend, create_worktree('HEAD') branches from the new commit."""
+        env = {
+            "GIT_AUTHOR_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@test.com",
+            "GIT_COMMITTER_NAME": "test",
+            "GIT_COMMITTER_EMAIL": "test@test.com",
+            "HOME": str(git_project.parent),
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+        }
+
+        (git_project / "new_file.txt").write_text("amended content")
+        subprocess.run(["git", "add", "."], cwd=git_project, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "--amend", "--no-edit"],
+            cwd=git_project,
+            capture_output=True,
+            check=True,
+            env=env,
+        )
+        amended_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_project,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        wt_path, branch = create_worktree(git_project, "HEAD")
+
+        wt_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=wt_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        assert wt_sha == amended_sha
+        assert (wt_path / "new_file.txt").exists()
+
+
 class TestSymlinkResolution:
-    def test_store_resolves_through_symlink(self, git_project: Path) -> None:
-        """ExperimentStore via worktree symlink writes to main .factory/."""
-        from factory.store import ExperimentStore
-
+    def test_shared_entries_resolve_to_main(self, git_project: Path) -> None:
+        """Shared symlinked entries in worktree resolve to main .factory/."""
         wt_path, _ = create_worktree(git_project)
-        store = ExperimentStore(wt_path)
+        main_factory = git_project / ".factory"
 
-        assert store.factory_dir.resolve() == (git_project / ".factory").resolve()
+        for entry in ("config.json", "results.tsv"):
+            wt_entry = wt_path / ".factory" / entry
+            assert wt_entry.is_symlink()
+            assert wt_entry.resolve() == (main_factory / entry).resolve()
 
-    def test_config_readable_through_symlink(self, git_project: Path) -> None:
+    def test_config_readable_through_selective_symlink(self, git_project: Path) -> None:
         wt_path, _ = create_worktree(git_project)
 
-        config_via_symlink = (wt_path / ".factory" / "config.json").read_text()
+        config_via_wt = (wt_path / ".factory" / "config.json").read_text()
         config_direct = (git_project / ".factory" / "config.json").read_text()
-        assert config_via_symlink == config_direct
+        assert config_via_wt == config_direct
+
+
+class TestSessionGuard:
+    """Tests for _has_active_sessions() and the remove_worktree() guard."""
+
+    def test_active_session_detected(self, tmp_path: Path) -> None:
+        sessions = [{"state": "working", "id": "abc"}]
+        result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(sessions),
+            stderr="",
+        )
+        with patch("factory.worktree.subprocess.run", return_value=result):
+            assert _has_active_sessions(tmp_path) is True
+
+    def test_blocked_session_detected(self, tmp_path: Path) -> None:
+        sessions = [{"state": "blocked", "id": "def"}]
+        result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(sessions),
+            stderr="",
+        )
+        with patch("factory.worktree.subprocess.run", return_value=result):
+            assert _has_active_sessions(tmp_path) is True
+
+    def test_no_active_sessions(self, tmp_path: Path) -> None:
+        sessions = [{"state": "completed", "id": "xyz"}]
+        result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(sessions),
+            stderr="",
+        )
+        with patch("factory.worktree.subprocess.run", return_value=result):
+            assert _has_active_sessions(tmp_path) is False
+
+    def test_empty_session_list(self, tmp_path: Path) -> None:
+        result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="[]",
+            stderr="",
+        )
+        with patch("factory.worktree.subprocess.run", return_value=result):
+            assert _has_active_sessions(tmp_path) is False
+
+    def test_command_failure_returns_false(self, tmp_path: Path) -> None:
+        result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr="error",
+        )
+        with patch("factory.worktree.subprocess.run", return_value=result):
+            assert _has_active_sessions(tmp_path) is False
+
+    def test_timeout_returns_false(self, tmp_path: Path) -> None:
+        with patch(
+            "factory.worktree.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=5),
+        ):
+            assert _has_active_sessions(tmp_path) is False
+
+    def test_invalid_json_returns_false(self, tmp_path: Path) -> None:
+        result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="not json",
+            stderr="",
+        )
+        with patch("factory.worktree.subprocess.run", return_value=result):
+            assert _has_active_sessions(tmp_path) is False
+
+    def test_non_list_json_returns_false(self, tmp_path: Path) -> None:
+        result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"state": "working"}',
+            stderr="",
+        )
+        with patch("factory.worktree.subprocess.run", return_value=result):
+            assert _has_active_sessions(tmp_path) is False
+
+    def test_remove_worktree_skips_when_active_sessions(self, git_project: Path) -> None:
+        wt_path, branch = create_worktree(git_project)
+        assert wt_path.exists()
+
+        with patch("factory.worktree._has_active_sessions", return_value=True):
+            remove_worktree(git_project, wt_path, branch)
+
+        assert wt_path.exists()
+
+    def test_remove_worktree_proceeds_when_no_active_sessions(self, git_project: Path) -> None:
+        wt_path, branch = create_worktree(git_project)
+        assert wt_path.exists()
+
+        with patch("factory.worktree._has_active_sessions", return_value=False):
+            remove_worktree(git_project, wt_path, branch)
+
+        assert not wt_path.exists()
 
 
 class TestFilelockConcurrency:
@@ -315,3 +580,759 @@ class TestFilelockConcurrency:
 
         assert id_a != id_b
         assert {id_a, id_b} == {1, 2}
+
+
+class TestCreateExperimentWorktree:
+    def test_creates_experiment_worktree(self, git_project: Path) -> None:
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_project,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        wt_path, branch = create_experiment_worktree(git_project, 1, head_sha)
+
+        assert wt_path.exists()
+        assert wt_path.is_dir()
+        assert branch == "factory/exp-1"
+        assert wt_path.name == "exp-1"
+        assert wt_path.parent == git_project / ".factory-worktrees"
+
+    def test_experiment_worktree_has_independent_factory_dir(self, git_project: Path) -> None:
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_project,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        wt_path, _ = create_experiment_worktree(git_project, 2, head_sha)
+
+        wt_factory = wt_path / ".factory"
+        assert wt_factory.is_dir()
+        assert not wt_factory.is_symlink()
+        assert (wt_factory / "config.json").read_text() == "{}"
+
+    def test_experiment_worktree_has_project_files(self, git_project: Path) -> None:
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_project,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        wt_path, _ = create_experiment_worktree(git_project, 3, head_sha)
+
+        assert (wt_path / "README.md").exists()
+        assert (wt_path / "README.md").read_text() == "hello"
+
+    def test_experiment_branch_checked_out(self, git_project: Path) -> None:
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_project,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        wt_path, branch = create_experiment_worktree(git_project, 4, head_sha)
+
+        result = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=wt_path,
+            capture_output=True,
+            text=True,
+        )
+        assert result.stdout.strip() == branch
+
+    def test_multiple_experiment_worktrees_coexist(self, git_project: Path) -> None:
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_project,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        wt1, br1 = create_experiment_worktree(git_project, 5, head_sha)
+        wt2, br2 = create_experiment_worktree(git_project, 6, head_sha)
+
+        assert wt1 != wt2
+        assert br1 != br2
+        assert wt1.exists()
+        assert wt2.exists()
+
+    def test_experiment_worktrees_have_isolated_eval_state(self, git_project: Path) -> None:
+        """Parallel experiment worktrees must not share last_eval.json."""
+        import json
+
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_project,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        wt1, _ = create_experiment_worktree(git_project, 10, head_sha)
+        wt2, _ = create_experiment_worktree(git_project, 11, head_sha)
+
+        (wt1 / ".factory" / "last_eval.json").write_text(json.dumps({"total": 0.9}))
+        (wt2 / ".factory" / "last_eval.json").write_text(json.dumps({"total": 0.3}))
+
+        score1 = json.loads((wt1 / ".factory" / "last_eval.json").read_text())["total"]
+        score2 = json.loads((wt2 / ".factory" / "last_eval.json").read_text())["total"]
+        assert score1 == 0.9
+        assert score2 == 0.3
+
+    def test_remove_experiment_worktree(self, git_project: Path) -> None:
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_project,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        wt_path, branch = create_experiment_worktree(git_project, 7, head_sha)
+        assert wt_path.exists()
+
+        remove_worktree(git_project, wt_path, branch)
+
+        assert not wt_path.exists()
+        result = subprocess.run(
+            ["git", "branch", "--list", branch],
+            cwd=git_project,
+            capture_output=True,
+            text=True,
+        )
+        assert branch not in result.stdout
+
+
+class TestPruneStaleExperimentWorktrees:
+    def test_cleans_orphaned_exp_directory(self, git_project: Path) -> None:
+        """prune_stale handles exp- prefixed directories with correct branch naming."""
+        wt_dir = git_project / ".factory-worktrees"
+        wt_dir.mkdir(parents=True, exist_ok=True)
+        orphan = wt_dir / "exp-99"
+        orphan.mkdir()
+        (orphan / "some_file.txt").write_text("stale")
+
+        pruned = prune_stale(git_project)
+        assert len(pruned) >= 1
+        assert not orphan.exists()
+        assert any("exp-99" in msg for msg in pruned)
+
+
+class TestSeedExperimentFactory:
+    def test_copies_config_files(self, tmp_path: Path) -> None:
+        source = tmp_path / ".factory"
+        source.mkdir()
+        (source / "config.json").write_text('{"key": "val"}')
+        (source / "eval_profile.json").write_text('{"dims": []}')
+
+        dest = tmp_path / "worktree" / ".factory"
+        _seed_experiment_factory(source, dest)
+
+        assert dest.is_dir()
+        assert not dest.is_symlink()
+        assert (dest / "config.json").read_text() == '{"key": "val"}'
+        assert (dest / "eval_profile.json").read_text() == '{"dims": []}'
+
+    def test_copies_strategy_directory(self, tmp_path: Path) -> None:
+        source = tmp_path / ".factory"
+        source.mkdir()
+        (source / "strategy").mkdir()
+        (source / "strategy" / "current.md").write_text("# strategy")
+
+        dest = tmp_path / "worktree" / ".factory"
+        _seed_experiment_factory(source, dest)
+
+        assert (dest / "strategy" / "current.md").read_text() == "# strategy"
+
+    def test_skips_mutable_state(self, tmp_path: Path) -> None:
+        source = tmp_path / ".factory"
+        source.mkdir()
+        (source / "config.json").write_text("{}")
+        (source / "results.tsv").write_text("id\n")
+        (source / "last_eval.json").write_text('{"total": 0.5}')
+        (source / "experiments").mkdir()
+        (source / "experiments" / "001").mkdir()
+
+        dest = tmp_path / "worktree" / ".factory"
+        _seed_experiment_factory(source, dest)
+
+        assert (dest / "config.json").exists()
+        assert not (dest / "results.tsv").exists()
+        assert not (dest / "last_eval.json").exists()
+        assert not (dest / "experiments").exists()
+
+    def test_replaces_existing_symlink(self, tmp_path: Path) -> None:
+        source = tmp_path / ".factory"
+        source.mkdir()
+        (source / "config.json").write_text("{}")
+
+        dest = tmp_path / "worktree" / ".factory"
+        dest.parent.mkdir(parents=True)
+        dest.symlink_to(source)
+        assert dest.is_symlink()
+
+        _seed_experiment_factory(source, dest)
+
+        assert dest.is_dir()
+        assert not dest.is_symlink()
+
+    def test_handles_missing_source(self, tmp_path: Path) -> None:
+        source = tmp_path / ".factory"
+        dest = tmp_path / "worktree" / ".factory"
+
+        _seed_experiment_factory(source, dest)
+
+        assert dest.is_dir()
+        assert list(dest.iterdir()) == []
+
+
+@pytest.fixture
+def unborn_repo(tmp_path: Path) -> Path:
+    """Create a git repo with no commits (unborn HEAD)."""
+    project = tmp_path / "unborn"
+    project.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=project, capture_output=True, check=True)
+    factory_dir = project / ".factory"
+    factory_dir.mkdir()
+    (factory_dir / "config.json").write_text("{}")
+    return project
+
+
+class TestIsUnbornRepo:
+    def test_unborn_repo_detected(self, unborn_repo: Path) -> None:
+        assert _is_unborn_repo(unborn_repo) is True
+
+    def test_repo_with_commits_not_unborn(self, git_project: Path) -> None:
+        assert _is_unborn_repo(git_project) is False
+
+
+class TestBootstrapUnbornRepo:
+    def test_creates_initial_commit(self, unborn_repo: Path) -> None:
+        env = {
+            "GIT_AUTHOR_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@test.com",
+            "GIT_COMMITTER_NAME": "test",
+            "GIT_COMMITTER_EMAIL": "test@test.com",
+            "HOME": str(unborn_repo.parent),
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+        }
+        with patch.dict("os.environ", env):
+            _bootstrap_unborn_repo(unborn_repo)
+
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=unborn_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+    def test_commit_message_is_factory_bootstrap(self, unborn_repo: Path) -> None:
+        env = {
+            "GIT_AUTHOR_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@test.com",
+            "GIT_COMMITTER_NAME": "test",
+            "GIT_COMMITTER_EMAIL": "test@test.com",
+            "HOME": str(unborn_repo.parent),
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+        }
+        with patch.dict("os.environ", env):
+            _bootstrap_unborn_repo(unborn_repo)
+
+        result = subprocess.run(
+            ["git", "log", "--oneline", "-1"],
+            cwd=unborn_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert "init (factory bootstrap)" in result.stdout
+
+
+class TestCreateWorktreeUnbornRepo:
+    def test_worktree_created_on_unborn_repo(self, unborn_repo: Path) -> None:
+        """create_worktree bootstraps an unborn repo and creates the worktree."""
+        env = {
+            "GIT_AUTHOR_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@test.com",
+            "GIT_COMMITTER_NAME": "test",
+            "GIT_COMMITTER_EMAIL": "test@test.com",
+            "HOME": str(unborn_repo.parent),
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+        }
+        with patch.dict("os.environ", env):
+            wt_path, branch = create_worktree(unborn_repo)
+
+        assert wt_path.exists()
+        assert branch.startswith("factory/run-")
+
+    def test_error_when_branch_missing_on_non_unborn_repo(self, git_project: Path) -> None:
+        """Raises RuntimeError if the base branch doesn't exist and repo is not unborn."""
+        with pytest.raises(RuntimeError, match="does not exist"):
+            create_worktree(git_project, base_branch="nonexistent-branch")
+
+
+class TestDetectDefaultBranchRemoteHead:
+    def test_uses_remote_head_when_available(self, git_project: Path) -> None:
+        """detect_default_branch returns the remote HEAD ref when origin is configured."""
+        subprocess.run(
+            ["git", "remote", "add", "origin", str(git_project)],
+            cwd=git_project,
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+            cwd=git_project,
+            capture_output=True,
+            check=True,
+        )
+
+        assert detect_default_branch(git_project) == "main"
+
+
+class TestPruneStaleNonexistentPath:
+    def test_returns_empty_for_nonexistent_path(self, tmp_path: Path) -> None:
+        gone = tmp_path / "does-not-exist"
+        assert prune_stale(gone) == []
+
+
+class TestSeedExperimentFactoryExistingDir:
+    def test_replaces_existing_directory(self, tmp_path: Path) -> None:
+        """When dest is an existing directory (not a symlink), it is replaced."""
+        source = tmp_path / ".factory"
+        source.mkdir()
+        (source / "config.json").write_text('{"new": true}')
+
+        dest = tmp_path / "worktree" / ".factory"
+        dest.mkdir(parents=True)
+        (dest / "stale.txt").write_text("old data")
+
+        _seed_experiment_factory(source, dest)
+
+        assert dest.is_dir()
+        assert not dest.is_symlink()
+        assert (dest / "config.json").read_text() == '{"new": true}'
+        assert not (dest / "stale.txt").exists()
+
+
+class TestEventEmissionFailure:
+    def test_event_error_does_not_propagate(self, git_project: Path) -> None:
+        """create_experiment_worktree swallows event emission errors."""
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_project,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        with patch("factory.events.emit_event", side_effect=RuntimeError("event bus down")):
+            wt_path, branch = create_experiment_worktree(git_project, 99, head_sha)
+
+        assert wt_path.exists()
+        assert branch == "factory/exp-99"
+
+
+class TestCreateWorktreeEventFailure:
+    def test_create_worktree_swallows_event_error(self, git_project: Path) -> None:
+        with patch("factory.events.emit_event", side_effect=RuntimeError("boom")):
+            wt_path, branch = create_worktree(git_project)
+
+        assert wt_path.exists()
+        assert branch.startswith("factory/run-")
+
+    def test_remove_worktree_swallows_event_error(self, git_project: Path) -> None:
+        wt_path, branch = create_worktree(git_project)
+
+        with patch("factory.events.emit_event", side_effect=RuntimeError("boom")):
+            remove_worktree(git_project, wt_path, branch)
+
+        assert not wt_path.exists()
+
+
+class TestCreateWorktreeExistingFactory:
+    def test_replaces_existing_factory_dir_with_selective_layout(self, tmp_path: Path) -> None:
+        """When .factory/ is tracked in git, the worktree replaces it with selective layout."""
+        project = tmp_path / "project"
+        project.mkdir()
+
+        env = {
+            "GIT_AUTHOR_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@test.com",
+            "GIT_COMMITTER_NAME": "test",
+            "GIT_COMMITTER_EMAIL": "test@test.com",
+            "HOME": str(tmp_path),
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+        }
+
+        subprocess.run(["git", "init", "-b", "main"], cwd=project, capture_output=True, check=True)
+        factory_dir = project / ".factory"
+        factory_dir.mkdir()
+        (factory_dir / "config.json").write_text("{}")
+        subprocess.run(["git", "add", "."], cwd=project, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial with .factory"],
+            cwd=project,
+            capture_output=True,
+            check=True,
+            env=env,
+        )
+
+        wt_path, _ = create_worktree(project)
+
+        wt_factory = wt_path / ".factory"
+        assert wt_factory.is_dir()
+        assert not wt_factory.is_symlink()
+        assert (wt_factory / "config.json").is_symlink()
+
+
+class TestPreserveTelemetryNoFactory:
+    def test_no_factory_dir_is_noop(self, git_project: Path) -> None:
+        """_preserve_telemetry returns early when worktree has no .factory/."""
+        from factory.worktree import _preserve_telemetry
+
+        fake_wt = git_project / "no-factory-here"
+        fake_wt.mkdir()
+
+        _preserve_telemetry(fake_wt, git_project)
+
+
+class TestDetectDefaultBranchFallback:
+    def test_fallback_when_all_detection_fails(self, tmp_path: Path) -> None:
+        """When every detection method fails, returns 'main'."""
+        project = tmp_path / "bare"
+        project.mkdir()
+        subprocess.run(["git", "init"], cwd=project, capture_output=True, check=True)
+
+        with patch(
+            "factory.worktree.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr="",
+            ),
+        ):
+            assert detect_default_branch(project) == "main"
+
+
+class TestDetectDefaultBranchUnborn:
+    def test_unborn_repo_returns_branch_via_symbolic_ref(self, unborn_repo: Path) -> None:
+        """Unborn repo (no commits) still detects the branch name from symbolic HEAD."""
+        result = detect_default_branch(unborn_repo)
+        assert result == "main"
+
+    def test_unborn_repo_with_custom_branch(self, tmp_path: Path) -> None:
+        """Unborn repo initialized with a non-standard branch name."""
+        project = tmp_path / "custom-branch"
+        project.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "trunk"],
+            cwd=project,
+            capture_output=True,
+            check=True,
+        )
+
+        result = detect_default_branch(project)
+        assert result == "trunk"
+
+
+class TestWorktreeRetention:
+    """Tests for FACTORY_REMOVE_WORKTREE config and _should_remove_worktree()."""
+
+    def test_remove_worktree_default_removes(
+        self, git_project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("FACTORY_REMOVE_WORKTREE", raising=False)
+        wt_path, branch = create_worktree(git_project)
+        assert wt_path.exists()
+
+        with patch("factory.worktree._has_active_sessions", return_value=False):
+            remove_worktree(git_project, wt_path, branch)
+
+        assert not wt_path.exists()
+
+    def test_remove_worktree_false_retains(
+        self, git_project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FACTORY_REMOVE_WORKTREE", "false")
+        wt_path, branch = create_worktree(git_project)
+        assert wt_path.exists()
+
+        with patch("factory.worktree._has_active_sessions", return_value=False):
+            remove_worktree(git_project, wt_path, branch)
+
+        assert wt_path.exists()
+
+    def test_remove_worktree_zero_retains(
+        self, git_project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FACTORY_REMOVE_WORKTREE", "0")
+        wt_path, branch = create_worktree(git_project)
+        assert wt_path.exists()
+
+        with patch("factory.worktree._has_active_sessions", return_value=False):
+            remove_worktree(git_project, wt_path, branch)
+
+        assert wt_path.exists()
+
+    def test_remove_worktree_no_retains(
+        self, git_project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FACTORY_REMOVE_WORKTREE", "no")
+        wt_path, branch = create_worktree(git_project)
+        assert wt_path.exists()
+
+        with patch("factory.worktree._has_active_sessions", return_value=False):
+            remove_worktree(git_project, wt_path, branch)
+
+        assert wt_path.exists()
+
+    def test_experiment_worktree_always_removed(
+        self, git_project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FACTORY_REMOVE_WORKTREE", "false")
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=git_project,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        wt_path, branch = create_experiment_worktree(git_project, 5, head_sha)
+        assert wt_path.exists()
+        assert branch == "factory/exp-5"
+
+        remove_worktree(git_project, wt_path, branch)
+
+        assert not wt_path.exists()
+
+    def test_retained_emits_event(self, git_project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FACTORY_REMOVE_WORKTREE", "false")
+        wt_path, branch = create_worktree(git_project)
+        run_id = branch.removeprefix("factory/run-")
+
+        with (
+            patch("factory.worktree._has_active_sessions", return_value=False),
+            patch("factory.events.emit_event") as mock_emit,
+        ):
+            remove_worktree(git_project, wt_path, branch)
+
+        mock_emit.assert_called_once_with(
+            git_project,
+            "worktree.retained",
+            data={
+                "run_id": run_id,
+                "branch": branch,
+                "worktree_path": str(wt_path),
+            },
+        )
+
+    def test_prune_stale_respects_retention_for_run(
+        self, git_project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FACTORY_REMOVE_WORKTREE", "false")
+        wt_dir = git_project / ".factory-worktrees"
+        wt_dir.mkdir(parents=True, exist_ok=True)
+        orphan = wt_dir / "run-deadbeef"
+        orphan.mkdir()
+        (orphan / "some_file.txt").write_text("stale")
+
+        pruned = prune_stale(git_project)
+
+        assert orphan.exists()
+        assert not any("run-deadbeef" in msg for msg in pruned)
+
+    def test_prune_stale_always_cleans_exp(
+        self, git_project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FACTORY_REMOVE_WORKTREE", "false")
+        wt_dir = git_project / ".factory-worktrees"
+        wt_dir.mkdir(parents=True, exist_ok=True)
+        orphan = wt_dir / "exp-99"
+        orphan.mkdir()
+        (orphan / "some_file.txt").write_text("stale")
+
+        pruned = prune_stale(git_project)
+
+        assert not orphan.exists()
+        assert any("exp-99" in msg for msg in pruned)
+
+
+class TestSelectiveWorktreeIsolation:
+    """Tests for selective symlink layout in CEO run worktrees (issue #1234)."""
+
+    def test_shared_entries_are_symlinks_to_main(self, git_project: Path) -> None:
+        factory_dir = git_project / ".factory"
+        (factory_dir / "eval_profile.json").write_text("{}")
+        (factory_dir / "experiments").mkdir(exist_ok=True)
+        (factory_dir / "archive").mkdir(exist_ok=True)
+        (factory_dir / "events.jsonl").write_text("")
+
+        wt_path, _ = create_worktree(git_project)
+        wt_factory = wt_path / ".factory"
+
+        for entry in _SHARED_SYMLINK_ENTRIES:
+            src = factory_dir / entry
+            dst = wt_factory / entry
+            if src.exists():
+                assert dst.is_symlink(), f"{entry} should be a symlink"
+                assert dst.resolve() == src.resolve(), f"{entry} should point to main"
+
+    def test_copy_entries_are_independent(self, git_project: Path) -> None:
+        agents_dir = git_project / ".factory" / "agents"
+        agents_dir.mkdir(exist_ok=True)
+        (agents_dir / "builder.md").write_text("# Builder")
+
+        wt_path, _ = create_worktree(git_project)
+        wt_agents = wt_path / ".factory" / "agents"
+
+        assert wt_agents.is_dir()
+        assert not wt_agents.is_symlink()
+        assert (wt_agents / "builder.md").read_text() == "# Builder"
+
+        (wt_agents / "builder.md").write_text("# Modified")
+        assert (agents_dir / "builder.md").read_text() == "# Builder"
+
+    def test_per_cycle_dirs_are_fresh_and_empty(self, git_project: Path) -> None:
+        strategy_dir = git_project / ".factory" / "strategy"
+        strategy_dir.mkdir(exist_ok=True)
+        (strategy_dir / "current.md").write_text("# Old strategy")
+        (strategy_dir / "observations.md").write_text("# Old obs")
+
+        reviews_dir = git_project / ".factory" / "reviews"
+        reviews_dir.mkdir(exist_ok=True)
+        (reviews_dir / "researcher-latest.md").write_text("# Old review")
+
+        wt_path, _ = create_worktree(git_project)
+        wt_factory = wt_path / ".factory"
+
+        for subdir in ("strategy", "reviews", "state"):
+            d = wt_factory / subdir
+            assert d.is_dir()
+            assert not d.is_symlink()
+
+        assert not (wt_factory / "strategy" / "current.md").exists()
+        assert not (wt_factory / "strategy" / "observations.md").exists()
+        assert not (wt_factory / "reviews" / "researcher-latest.md").exists()
+        assert list((wt_factory / "state").iterdir()) == []
+
+    def test_backlog_copied_not_symlinked(self, git_project: Path) -> None:
+        strategy_dir = git_project / ".factory" / "strategy"
+        strategy_dir.mkdir(exist_ok=True)
+        (strategy_dir / "backlog.md").write_text("- item 1\n- item 2\n")
+
+        wt_path, _ = create_worktree(git_project)
+        wt_backlog = wt_path / ".factory" / "strategy" / "backlog.md"
+
+        assert wt_backlog.exists()
+        assert not wt_backlog.is_symlink()
+        assert wt_backlog.read_text() == "- item 1\n- item 2\n"
+
+    def test_backlog_synced_back_on_removal(self, git_project: Path) -> None:
+        strategy_dir = git_project / ".factory" / "strategy"
+        strategy_dir.mkdir(exist_ok=True)
+        (strategy_dir / "backlog.md").write_text("- item 1\n")
+
+        wt_path, branch = create_worktree(git_project)
+        wt_backlog = wt_path / ".factory" / "strategy" / "backlog.md"
+        wt_backlog.write_text("- item 1\n- item 2\n- item 3\n")
+
+        remove_worktree(git_project, wt_path, branch)
+
+        main_backlog = git_project / ".factory" / "strategy" / "backlog.md"
+        assert main_backlog.read_text() == "- item 1\n- item 2\n- item 3\n"
+
+    def test_sync_backlog_to_main_skips_symlink(self, tmp_path: Path) -> None:
+        wt = tmp_path / "worktree"
+        wt.mkdir()
+        main = tmp_path / "main"
+        main.mkdir()
+
+        strategy_dir = wt / ".factory" / "strategy"
+        strategy_dir.mkdir(parents=True)
+        backlog = strategy_dir / "backlog.md"
+
+        main_strategy = main / ".factory" / "strategy"
+        main_strategy.mkdir(parents=True)
+        main_backlog = main_strategy / "backlog.md"
+        main_backlog.write_text("original")
+
+        backlog.symlink_to(main_backlog)
+
+        _sync_backlog_to_main(wt, main)
+
+        assert main_backlog.read_text() == "original"
+
+    def test_two_worktrees_get_independent_dirs(self, git_project: Path) -> None:
+        strategy_dir = git_project / ".factory" / "strategy"
+        strategy_dir.mkdir(exist_ok=True)
+        (strategy_dir / "backlog.md").write_text("- shared item\n")
+
+        wt1, _ = create_worktree(git_project)
+        wt2, _ = create_worktree(git_project)
+
+        (wt1 / ".factory" / "strategy" / "current.md").write_text("# WT1 strategy")
+        (wt1 / ".factory" / "reviews" / "researcher-latest.md").write_text("# WT1 review")
+
+        assert not (wt2 / ".factory" / "strategy" / "current.md").exists()
+        assert not (wt2 / ".factory" / "reviews" / "researcher-latest.md").exists()
+
+        (wt2 / ".factory" / "strategy" / "current.md").write_text("# WT2 strategy")
+        assert (wt1 / ".factory" / "strategy" / "current.md").read_text() == "# WT1 strategy"
+
+    def test_shared_entries_write_to_main(self, git_project: Path) -> None:
+        """Appending to symlinked results.tsv writes through to main."""
+        wt_path, _ = create_worktree(git_project)
+
+        wt_results = wt_path / ".factory" / "results.tsv"
+        with open(wt_results, "a") as f:
+            f.write("1\tdata\n")
+
+        main_results = git_project / ".factory" / "results.tsv"
+        assert "1\tdata\n" in main_results.read_text()
+
+    def test_preserve_telemetry_works_with_selective_layout(self, git_project: Path) -> None:
+        wt_path, _ = create_worktree(git_project)
+
+        (wt_path / ".factory" / "trace_id.txt").write_text("trace-abc")
+
+        main_trace = git_project / ".factory" / "trace_id.txt"
+        assert not main_trace.exists()
+
+        _preserve_telemetry(wt_path, git_project)
+
+        assert main_trace.exists()
+        assert main_trace.read_text() == "trace-abc"
+
+    def test_missing_shared_entries_skipped(self, git_project: Path) -> None:
+        """Shared entries that don't exist in main are silently skipped."""
+        assert not (git_project / ".factory" / "archive").exists()
+        assert not (git_project / ".factory" / "events.jsonl").exists()
+
+        wt_path, _ = create_worktree(git_project)
+        wt_factory = wt_path / ".factory"
+
+        assert not (wt_factory / "archive").exists()
+        assert not (wt_factory / "events.jsonl").exists()
+        assert (wt_factory / "config.json").is_symlink()
+
+    def test_no_backlog_no_error(self, git_project: Path) -> None:
+        """Worktree creation succeeds when main has no backlog.md."""
+        assert not (git_project / ".factory" / "strategy" / "backlog.md").exists()
+
+        wt_path, _ = create_worktree(git_project)
+
+        assert (wt_path / ".factory" / "strategy").is_dir()
+        assert not (wt_path / ".factory" / "strategy" / "backlog.md").exists()

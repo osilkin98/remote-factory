@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -13,6 +14,7 @@ from factory.strategy import (
 )
 from factory.precheck import (
     check_anti_pattern,
+    check_qa_execution,
     check_score_direction,
     check_scope,
     check_surfaces,
@@ -241,6 +243,119 @@ class TestCheckSurfaces:
         assert "not found" in r.detail.lower()
 
 
+# ── precheck: check_qa_execution ─────────────────────────────
+
+
+def _write_events(tmp_path: Path, events: list[dict]) -> None:
+    """Helper to write events.jsonl in a .factory/ dir."""
+    factory_dir = tmp_path / ".factory"
+    factory_dir.mkdir(exist_ok=True)
+    lines = [json.dumps(e) for e in events]
+    (factory_dir / "events.jsonl").write_text("\n".join(lines) + "\n")
+
+
+class TestCheckQaExecution:
+    def test_qa_execution_guard_pass(self, tmp_path: Path) -> None:
+        """events.jsonl has qa.completed after experiment.begin → passes."""
+        _write_events(tmp_path, [
+            {
+                "type": "experiment.begin",
+                "timestamp": "2026-06-27T10:00:00+00:00",
+                "project": "test",
+                "agent": None,
+                "data": {"exp_id": 1},
+            },
+            {
+                "type": "agent.completed",
+                "timestamp": "2026-06-27T10:05:00+00:00",
+                "project": "test",
+                "agent": "builder",
+                "data": {},
+            },
+            {
+                "type": "agent.completed",
+                "timestamp": "2026-06-27T10:10:00+00:00",
+                "project": "test",
+                "agent": "health_checker",
+                "data": {},
+            },
+        ])
+        result = check_qa_execution(tmp_path, exp_id=1)
+        assert result.passed
+        assert result.name == "qa_execution"
+
+    def test_qa_execution_guard_pass_with_qa_completed_type(self, tmp_path: Path) -> None:
+        """qa.completed event type also satisfies the check."""
+        _write_events(tmp_path, [
+            {
+                "type": "experiment.begin",
+                "timestamp": "2026-06-27T10:00:00+00:00",
+                "project": "test",
+                "agent": None,
+                "data": {"exp_id": 1},
+            },
+            {
+                "type": "qa.completed",
+                "timestamp": "2026-06-27T10:10:00+00:00",
+                "project": "test",
+                "agent": "qa",
+                "data": {},
+            },
+        ])
+        result = check_qa_execution(tmp_path, exp_id=1)
+        assert result.passed
+
+    def test_qa_execution_guard_fail(self, tmp_path: Path) -> None:
+        """builder.completed without qa.completed → fails."""
+        _write_events(tmp_path, [
+            {
+                "type": "experiment.begin",
+                "timestamp": "2026-06-27T10:00:00+00:00",
+                "project": "test",
+                "agent": None,
+                "data": {"exp_id": 1},
+            },
+            {
+                "type": "agent.completed",
+                "timestamp": "2026-06-27T10:05:00+00:00",
+                "project": "test",
+                "agent": "builder",
+                "data": {},
+            },
+        ])
+        result = check_qa_execution(tmp_path, exp_id=1)
+        assert not result.passed
+        assert "Sacred Rule 9" in result.detail
+
+    def test_qa_execution_guard_no_exp_id(self, tmp_path: Path) -> None:
+        """When exp_id is None, QA check is skipped (backwards compatible)."""
+        _write_events(tmp_path, [
+            {
+                "type": "experiment.begin",
+                "timestamp": "2026-06-27T10:00:00+00:00",
+                "project": "test",
+                "agent": None,
+                "data": {"exp_id": 1},
+            },
+        ])
+        result = run_precheck(
+            score_before=0.7,
+            score_after=0.85,
+            threshold=0.8,
+            hypothesis="test",
+            history=[],
+            project_path=tmp_path,
+            exp_id=None,
+        )
+        check_names = [c.name for c in result.checks]
+        assert "qa_execution" not in check_names
+
+    def test_qa_execution_guard_no_events_file(self, tmp_path: Path) -> None:
+        """No events.jsonl → passes (no experiment.begin found)."""
+        result = check_qa_execution(tmp_path, exp_id=1)
+        assert result.passed
+
+
 # ── precheck: run_precheck ────────────────────────────────────
 
 
@@ -401,6 +516,38 @@ class TestFormatReview:
         assert "Score Comparison" in body
         assert "n/a" in body
 
+    def test_qa_body_rendered(self):
+        payload = ReviewPayload(
+            verdict="KEEP",
+            reason="All good",
+            score_before=0.8,
+            score_after=0.9,
+            threshold=0.8,
+            guard_results={},
+            precheck_summary="",
+            code_notes=[],
+            qa_body="Found 2 issues:\n- Missing error handling\n- No input validation",
+        )
+        body = format_review(payload)
+        assert "### QA Analysis" in body
+        assert "Found 2 issues:" in body
+        assert "Missing error handling" in body
+
+    def test_qa_body_empty_omitted(self):
+        payload = ReviewPayload(
+            verdict="KEEP",
+            reason="All good",
+            score_before=0.8,
+            score_after=0.9,
+            threshold=0.8,
+            guard_results={},
+            precheck_summary="",
+            code_notes=[],
+            qa_body="",
+        )
+        body = format_review(payload)
+        assert "### QA Analysis" not in body
+
     def test_minimal_payload(self):
         payload = ReviewPayload(
             verdict="KEEP",
@@ -425,7 +572,7 @@ class TestPostReview:
     def test_success(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
         assert post_review(42, "body", "KEEP") is True
-        call_args = mock_run.call_args[0][0]
+        call_args = mock_run.call_args_list[0][0][0]
         assert "--approve" in call_args
         assert "42" in call_args
 
@@ -449,9 +596,10 @@ class TestPostReview:
         mock_run.side_effect = [
             MagicMock(returncode=1, stderr="auth error"),
             MagicMock(returncode=0),
+            MagicMock(returncode=0),
         ]
         assert post_review(42, "body", "KEEP") is True
-        assert mock_run.call_count == 2
+        assert mock_run.call_count == 3
         fallback_cmd = mock_run.call_args_list[1][0][0]
         assert fallback_cmd[:3] == ["gh", "pr", "comment"]
 
@@ -517,6 +665,51 @@ class TestCLIParser:
         assert args.verdict == "KEEP"
         assert args.pr == 99
         assert args.dry_run is True
+
+    def test_review_parser_qa_body_file(self):
+        from factory.cli import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args([
+            "review",
+            "--verdict", "KEEP",
+            "--qa-body-file", "/tmp/qa-latest.md",
+        ])
+        assert args.qa_body_file == "/tmp/qa-latest.md"
+
+    def test_cmd_review_qa_body_file(self, tmp_path, capsys):
+        from factory.cli import cmd_review, build_parser
+
+        body_file = tmp_path / "qa-report.md"
+        body_file.write_text("## Health Check\nAll tests pass.")
+
+        parser = build_parser()
+        args = parser.parse_args([
+            "review",
+            "--verdict", "KEEP",
+            "--qa-body-file", str(body_file),
+            "--dry-run",
+        ])
+        result = cmd_review(args)
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "### QA Analysis" in captured.out
+        assert "All tests pass." in captured.out
+
+    def test_cmd_review_qa_body_file_missing(self, tmp_path, capsys):
+        from factory.cli import cmd_review, build_parser
+
+        parser = build_parser()
+        args = parser.parse_args([
+            "review",
+            "--verdict", "KEEP",
+            "--qa-body-file", str(tmp_path / "nonexistent.md"),
+            "--dry-run",
+        ])
+        result = cmd_review(args)
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "### QA Analysis" not in captured.out
 
     def test_review_parser_minimal(self):
         from factory.cli import build_parser

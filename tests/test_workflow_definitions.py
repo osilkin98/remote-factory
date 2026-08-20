@@ -1,0 +1,1102 @@
+"""Tier 3: Workflow definition tests — verify all workflows pass validation."""
+
+from __future__ import annotations
+
+from collections import defaultdict, deque
+
+import pytest
+
+from factory.models import ProjectState
+from factory.workflow.definitions import (
+    DOC_FRESHNESS_GATE_PROMPT,
+    _GRAPH_EXPLORER_PROMPT,  # noqa: F401
+    _graph_explorer_prompt,  # noqa: F401
+    _study_subgraph,  # noqa: F401
+    build_workflow,
+    create_workflow,
+    design_workflow,
+    doc_generate_workflow,
+    doc_update_workflow,
+    founder_workflow,
+    improve_workflow,
+    meta_workflow,
+    refine_workflow,
+    register_all,
+    research_workflow,
+    study_standalone_workflow,  # noqa: F401
+)
+from factory.workflow.primitives import (
+    AgentNode,
+    AgentRole,
+    FnNode,
+    ForkNode,
+    GateNode,
+    JoinNode,
+    Study,
+    VerdictType,
+)
+
+
+# ── All workflows pass validation ────────────────────────────────
+
+
+class TestAllWorkflowsValid:
+    def test_build_valid(self) -> None:
+        wf = build_workflow()
+        issues = wf.validate_graph()
+        assert issues == [], f"build workflow has issues: {issues}"
+
+    def test_design_valid(self) -> None:
+        wf = design_workflow()
+        issues = wf.validate_graph()
+        assert issues == [], f"design workflow has issues: {issues}"
+
+    def test_improve_valid(self) -> None:
+        wf = improve_workflow()
+        issues = wf.validate_graph()
+        assert issues == [], f"improve workflow has issues: {issues}"
+
+    def test_research_valid(self) -> None:
+        wf = research_workflow()
+        issues = wf.validate_graph()
+        assert issues == [], f"research workflow has issues: {issues}"
+
+    def test_meta_valid(self) -> None:
+        wf = meta_workflow()
+        issues = wf.validate_graph()
+        assert issues == [], f"meta workflow has issues: {issues}"
+
+
+# ── Triggers ─────────────────────────────────────────────────────
+
+
+class TestTriggers:
+    def test_build_trigger(self) -> None:
+        wf = build_workflow()
+        assert wf.trigger is not None
+        assert wf.trigger(ProjectState.NO_REPO, {})
+        assert wf.trigger(ProjectState.REPO_INCOMPLETE, {})
+        assert not wf.trigger(ProjectState.HAS_FACTORY, {})
+
+    def test_design_trigger(self) -> None:
+        wf = design_workflow()
+        assert wf.trigger is not None
+        assert wf.trigger(ProjectState.NO_REPO, {"interactive": True})
+        assert not wf.trigger(ProjectState.NO_REPO, {"interactive": False})
+        assert not wf.trigger(ProjectState.NO_REPO, {})
+        # HAS_FACTORY now fires for design mode
+        assert wf.trigger(ProjectState.HAS_FACTORY, {"interactive": True})
+        assert not wf.trigger(ProjectState.HAS_FACTORY, {"interactive": False})
+
+    def test_improve_trigger(self) -> None:
+        wf = improve_workflow()
+        assert wf.trigger is not None
+        assert wf.trigger(ProjectState.HAS_FACTORY, {})
+        assert not wf.trigger(ProjectState.NO_REPO, {})
+
+    def test_research_trigger(self) -> None:
+        wf = research_workflow()
+        assert wf.trigger is not None
+        assert wf.trigger(ProjectState.HAS_FACTORY, {"research_target": "accuracy"})
+        assert not wf.trigger(ProjectState.HAS_FACTORY, {})
+
+    def test_meta_trigger(self) -> None:
+        wf = meta_workflow()
+        assert wf.trigger is not None
+        assert wf.trigger(ProjectState.HAS_FACTORY, {"mode": "meta"})
+        assert not wf.trigger(ProjectState.HAS_FACTORY, {})
+
+
+# ── W₂ = W₁[gate_strategy ← user] ──────────────────────────────
+
+
+class TestDesignIsBuiltWithUserGate:
+    def test_design_strategy_gate_is_user(self) -> None:
+        """W₂ differs from W₁ only at the strategy gate."""
+        w1 = build_workflow()
+        w2 = design_workflow()
+
+        gate_w1 = w1.nodes.get("gate_strategy")
+        gate_w2 = w2.nodes.get("gate_strategy")
+
+        assert isinstance(gate_w1, GateNode)
+        assert isinstance(gate_w2, GateNode)
+
+        assert gate_w1.evaluator_type == "agent"
+        assert gate_w2.evaluator_type == "user"
+
+    def test_design_shares_other_nodes(self) -> None:
+        """W₂ shares all build node IDs with W₁, plus gate_has_factory, discover, and study subgraph."""
+        w1 = build_workflow()
+        w2 = design_workflow()
+
+        w1_ids = set(w1.nodes.keys())
+        w2_ids = set(w2.nodes.keys())
+
+        # Design has extra nodes: gate_has_factory, discover, and study subgraph
+        assert w2_ids == w1_ids | {
+            "gate_has_factory",
+            "discover",
+            "graph_update",
+            "study",
+            "graph_explorer",
+            "concat_study",
+        }
+
+    def test_design_name(self) -> None:
+        wf = design_workflow()
+        assert wf.name == "design"
+
+
+# ── Design study node tests ──────────────────────────────────────
+
+
+class TestDesignStudyNode:
+    """Verify design mode's conditional study path for existing projects."""
+
+    def test_design_has_study_node(self) -> None:
+        """Design workflow must contain a study node."""
+        wf = design_workflow()
+        assert "study" in wf.nodes
+        assert isinstance(wf.nodes["study"], Study)
+
+    def test_design_has_gate_has_factory(self) -> None:
+        """Design workflow must contain the gate_has_factory conditional gate."""
+        wf = design_workflow()
+        assert "gate_has_factory" in wf.nodes
+        gate = wf.nodes["gate_has_factory"]
+        assert isinstance(gate, GateNode)
+        assert gate.evaluator_type == "fn"
+
+    def test_design_study_writes_observations(self) -> None:
+        """Study node must write observations.md."""
+        wf = design_workflow()
+        study = wf.nodes["study"]
+        assert ".factory/strategy/observations.md" in study.writes
+
+    def test_design_concat_study_to_fork_research_edge(self) -> None:
+        """There must be an unconditional edge from concat_study to fork_research."""
+        wf = design_workflow()
+        assert any(
+            e.source == "concat_study" and e.target == "fork_research" and e.condition is None
+            for e in wf.edges
+        )
+
+    def test_design_gate_routes_to_graph_update(self) -> None:
+        """gate_has_factory PROCEED must route to graph_update."""
+        wf = design_workflow()
+        assert any(
+            e.source == "gate_has_factory"
+            and e.target == "graph_update"
+            and e.condition == VerdictType.PROCEED
+            for e in wf.edges
+        )
+
+    def test_design_gate_routes_to_discover(self) -> None:
+        """gate_has_factory HALT must route to discover (not fork_research)."""
+        wf = design_workflow()
+        assert any(
+            e.source == "gate_has_factory"
+            and e.target == "discover"
+            and e.condition == VerdictType.HALT
+            for e in wf.edges
+        )
+
+    def test_design_has_discover_node(self) -> None:
+        """Design workflow must contain a discover FnNode."""
+        wf = design_workflow()
+        assert "discover" in wf.nodes
+        node = wf.nodes["discover"]
+        assert isinstance(node, FnNode)
+        assert node.command == "factory discover {project_path}"
+        assert ".factory/eval_profile.json" in node.writes
+
+    def test_design_discover_to_graph_update_edge(self) -> None:
+        """There must be an unconditional edge from discover to graph_update."""
+        wf = design_workflow()
+        assert any(
+            e.source == "discover" and e.target == "graph_update" and e.condition is None
+            for e in wf.edges
+        )
+
+
+# ── W₄ structural delta from W₃ ─────────────────────────────────
+
+
+class TestResearchExtendsImprove:
+    def test_research_has_baseline(self) -> None:
+        """W₄ replaces study with baseline measurement."""
+        wf = research_workflow()
+        assert "baseline" in wf.nodes
+        assert "study" not in wf.nodes
+
+    def test_research_has_failure_analyst(self) -> None:
+        """W₄ has failure_analyst between baseline and researcher."""
+        wf = research_workflow()
+        assert "failure_analyst" in wf.nodes
+        node = wf.nodes["failure_analyst"]
+        assert isinstance(node, AgentNode)
+        assert node.role == AgentRole.FAILURE_ANALYST
+
+    def test_research_has_plateau_gate(self) -> None:
+        """W₄ has plateau detection gate."""
+        wf = research_workflow()
+        assert "plateau_gate" in wf.nodes
+        assert isinstance(wf.nodes["plateau_gate"], GateNode)
+
+    def test_research_start_node(self) -> None:
+        wf = research_workflow()
+        assert wf.start_node == "baseline"
+
+
+# ── W₅ Meta structure ────────────────────────────────────────────
+
+
+class TestMetaStructure:
+    def test_meta_has_insights(self) -> None:
+        wf = meta_workflow()
+        assert "insights" in wf.nodes
+        assert isinstance(wf.nodes["insights"], FnNode)
+
+    def test_meta_archivist_chains_to_test(self) -> None:
+        """Archivist (non-blocking) chains directly to test_collect."""
+        wf = meta_workflow()
+        edges_from_archivist = [e for e in wf.edges if e.source == "archivist"]
+        assert any(e.target == "test_collect" for e in edges_from_archivist)
+
+    def test_meta_has_test_pruning(self) -> None:
+        wf = meta_workflow()
+        assert "test_collect" in wf.nodes
+        assert "test_researcher" in wf.nodes
+        assert "gate_test_prune" in wf.nodes
+        assert "test_builder" in wf.nodes
+
+    def test_meta_has_user_gates(self) -> None:
+        wf = meta_workflow()
+        gate_user = wf.nodes.get("gate_user")
+        gate_test = wf.nodes.get("gate_test_prune")
+        assert isinstance(gate_user, GateNode)
+        assert isinstance(gate_test, GateNode)
+        assert gate_user.evaluator_type == "user"
+        assert gate_test.evaluator_type == "user"
+
+    def test_meta_archivist_nonblocking(self) -> None:
+        wf = meta_workflow()
+        archivist = wf.nodes.get("archivist")
+        assert archivist is not None
+        assert archivist.blocking is False
+
+
+# ── Agent pool assignments ───────────────────────────────────────
+
+
+class TestAgentPool:
+    def test_default_pool_models(self) -> None:
+        from factory.workflow.primitives import DEFAULT_AGENT_POOL
+
+        expected = {
+            "researcher": "sonnet",
+            "strategist": "opus",
+            "builder": "opus",
+            "health_checker": "opus",
+            "code_reviewer": "opus",
+            "adversarial_tester": "opus",
+            "failure_analyst": "opus",
+            "ceo": "opus",
+            "archivist": "haiku",
+            "refiner": "opus",
+            "skill_reviewer": "opus",
+        }
+
+        for role, model in expected.items():
+            assert role in DEFAULT_AGENT_POOL, f"missing role: {role}"
+            assert DEFAULT_AGENT_POOL[role].model == model, (
+                f"wrong model for {role}: expected {model}, got {DEFAULT_AGENT_POOL[role].model}"
+            )
+
+
+# ── Register all ─────────────────────────────────────────────────
+
+
+class TestRegisterAll:
+    def test_all_workflows_registered(self) -> None:
+        all_wf = register_all()
+        assert len(all_wf) >= 13, f"Expected at least 13 workflows, got {len(all_wf)}"
+        required = {
+            "build",
+            "design",
+            "improve",
+            "deep-qa",
+            "deep-research",
+            "research",
+            "meta",
+            "discover",
+            "review",
+            "refine",
+            "create",
+            "skill-refine",
+            "spec-generate",
+            "spec-update",
+            "founder",
+            "study",
+        }
+        assert required.issubset(set(all_wf.keys())), f"Missing: {required - set(all_wf.keys())}"
+
+    def test_all_validate(self) -> None:
+        all_wf = register_all()
+        for name, wf in all_wf.items():
+            issues = wf.validate_graph()
+            assert issues == [], f"{name} has validation issues: {issues}"
+
+
+# ── Study Mode structure ────────────────────────────────────────
+
+
+class TestStudyWorkflow:
+    def test_node_ids(self) -> None:
+        wf = study_standalone_workflow()
+        assert set(wf.nodes.keys()) == {
+            "graph_update",
+            "study",
+            "graph_explorer",
+            "concat_study",
+        }
+
+    def test_start_node(self) -> None:
+        wf = study_standalone_workflow()
+        assert wf.start_node == "graph_update"
+
+    def test_trigger(self) -> None:
+        wf = study_standalone_workflow()
+        assert wf.trigger is not None
+        assert wf.trigger(ProjectState.HAS_FACTORY, {"mode": "study"})
+        assert not wf.trigger(ProjectState.HAS_FACTORY, {"mode": "improve"})
+        assert not wf.trigger(ProjectState.NO_REPO, {"mode": "study"})
+
+    def test_terminal(self) -> None:
+        wf = study_standalone_workflow()
+        assert wf.terminal is True
+
+    def test_valid(self) -> None:
+        wf = study_standalone_workflow()
+        issues = wf.validate_graph()
+        assert issues == [], f"study workflow has issues: {issues}"
+
+    def test_study_writes_observations(self) -> None:
+        wf = study_standalone_workflow()
+        node = wf.nodes["study"]
+        assert ".factory/strategy/observations.md" in node.writes
+
+    def test_graph_explorer_is_researcher(self) -> None:
+        wf = study_standalone_workflow()
+        node = wf.nodes["graph_explorer"]
+        assert isinstance(node, AgentNode)
+        assert node.role == AgentRole.RESEARCHER
+
+    def test_graph_explorer_prompt_includes_project_path_in_commands(self) -> None:
+        wf = study_standalone_workflow()
+        node = wf.nodes["graph_explorer"]
+        prompt = node.prompt_template
+        assert "test -f graph.json" in prompt, (
+            "smoke check must use relative path (CWD is project root)"
+        )
+        assert 'factory graph query "{project_path}"' in prompt, (
+            "graph query command must use {project_path} template"
+        )
+        assert 'factory graph explain "{project_path}"' in prompt, (
+            "graph explain command must use {project_path} template"
+        )
+        assert 'factory graph path "{project_path}"' in prompt, (
+            "graph path command must use {project_path} template"
+        )
+        assert "{project_path}/graph.json" in prompt, (
+            "prompt must reference graph.json with {project_path} prefix"
+        )
+        assert "NOT inside `.factory/`" in prompt, "prompt must clarify graph.json is not in .factory/"
+
+    def test_concat_study_writes_combined(self) -> None:
+        wf = study_standalone_workflow()
+        node = wf.nodes["concat_study"]
+        assert ".factory/strategy/study-combined.md" in node.writes
+
+
+class TestDesignStudySubgraph:
+    def test_graph_nodes_exist(self) -> None:
+        wf = design_workflow()
+        assert "graph_update" in wf.nodes
+        assert "study" in wf.nodes
+        assert "graph_explorer" in wf.nodes
+        assert "concat_study" in wf.nodes
+
+    def test_edge_wiring(self) -> None:
+        wf = design_workflow()
+        assert any(e.source == "graph_update" and e.target == "study" for e in wf.edges)
+        assert any(e.source == "study" and e.target == "graph_explorer" for e in wf.edges)
+        assert any(e.source == "graph_explorer" and e.target == "concat_study" for e in wf.edges)
+        assert any(e.source == "concat_study" and e.target == "fork_research" for e in wf.edges)
+
+    def test_graph_update_is_fn_node(self) -> None:
+        wf = design_workflow()
+        node = wf.nodes["graph_update"]
+        assert isinstance(node, FnNode)
+        assert "factory graph update" in node.command
+
+    def test_graph_explorer_writes_context(self) -> None:
+        wf = design_workflow()
+        node = wf.nodes["graph_explorer"]
+        assert ".factory/strategy/graph-context.md" in node.writes
+
+    def test_concat_study_writes_combined(self) -> None:
+        wf = design_workflow()
+        node = wf.nodes["concat_study"]
+        assert ".factory/strategy/study-combined.md" in node.writes
+
+
+# ── W₉ Create structure ────────────────────────────────────────
+
+
+class TestCreateStructure:
+    def test_create_valid(self) -> None:
+        wf = create_workflow()
+        issues = wf.validate_graph()
+        assert issues == [], f"create workflow has issues: {issues}"
+
+    def test_create_trigger(self) -> None:
+        wf = create_workflow()
+        assert wf.trigger is not None
+        assert wf.trigger(ProjectState.HAS_FACTORY, {"mode": "create"})
+        assert wf.trigger(ProjectState.NO_REPO, {"mode": "create"})
+        assert not wf.trigger(ProjectState.HAS_FACTORY, {})
+        assert not wf.trigger(ProjectState.HAS_FACTORY, {"mode": "improve"})
+
+    def test_create_name(self) -> None:
+        wf = create_workflow()
+        assert wf.name == "create"
+
+    def test_create_has_parallel_research(self) -> None:
+        wf = create_workflow()
+        assert "fork_research" in wf.nodes
+        assert "join_research" in wf.nodes
+        fork = wf.nodes["fork_research"]
+        assert isinstance(fork, ForkNode)
+        assert len(fork.targets) == 3
+        join = wf.nodes["join_research"]
+        assert isinstance(join, JoinNode)
+        assert len(join.sources) == 3
+
+    def test_create_has_user_gate(self) -> None:
+        """Create mode has a user approval gate at strategy."""
+        wf = create_workflow()
+        gate = wf.nodes.get("gate_strategy")
+        assert isinstance(gate, GateNode)
+        assert gate.evaluator_type == "user"
+
+    def test_create_has_builder_qa_loop(self) -> None:
+        """Create mode has the builder → deep-qa → gate loop."""
+        wf = create_workflow()
+        assert "builder" in wf.nodes
+        assert "health_checker" in wf.nodes
+        assert "gate_qa" in wf.nodes
+        assert "gate_build" in wf.nodes
+        reloop_edges = [e for e in wf.edges if e.source == "gate_qa" and e.target == "builder"]
+        assert len(reloop_edges) == 1
+
+    def test_create_has_precheck(self) -> None:
+        wf = create_workflow()
+        assert "gate_precheck" in wf.nodes
+        precheck = wf.nodes["gate_precheck"]
+        assert isinstance(precheck, GateNode)
+        assert precheck.evaluator_type == "fn"
+
+    def test_create_archivists_nonblocking(self) -> None:
+        wf = create_workflow()
+        for nid in ("archivist_plan", "archivist_build"):
+            node = wf.nodes.get(nid)
+            assert node is not None, f"missing {nid}"
+            assert node.blocking is False
+
+    def test_create_start_node(self) -> None:
+        wf = create_workflow()
+        assert wf.start_node == "fork_research"
+
+    def test_create_skill_export(self) -> None:
+        from factory.workflow.skill_export import validate_skill, workflow_to_skill_md
+
+        wf = create_workflow()
+        skill_md = workflow_to_skill_md(wf)
+        issues = validate_skill(skill_md)
+        assert issues == [], f"create skill has issues: {issues}"
+        assert "workflow-create" in skill_md
+        assert "User Approval" in skill_md
+
+
+# ── gate_doc_freshness ──────────────────────────────────────────
+
+
+class TestDocFreshnessGate:
+    @pytest.mark.parametrize(
+        "workflow_fn",
+        [build_workflow, improve_workflow, research_workflow, refine_workflow, create_workflow],
+        ids=["build", "improve", "research", "refine", "create"],
+    )
+    def test_gate_exists_as_gate_node(self, workflow_fn) -> None:
+        wf = workflow_fn()
+        assert "gate_doc_freshness" in wf.nodes
+        gate = wf.nodes["gate_doc_freshness"]
+        assert isinstance(gate, GateNode)
+        assert gate.evaluator_type == "agent"
+        assert gate.evaluator_role == AgentRole.CEO
+
+    @pytest.mark.parametrize(
+        "workflow_fn",
+        [build_workflow, improve_workflow, refine_workflow, create_workflow],
+        ids=["build", "improve", "refine", "create"],
+    )
+    def test_gate_uses_shared_prompt(self, workflow_fn) -> None:
+        wf = workflow_fn()
+        gate = wf.nodes["gate_doc_freshness"]
+        assert isinstance(gate, GateNode)
+        assert gate.gate_prompt is DOC_FRESHNESS_GATE_PROMPT
+
+    def test_design_inherits_gate(self) -> None:
+        wf = design_workflow()
+        assert "gate_doc_freshness" in wf.nodes
+        assert isinstance(wf.nodes["gate_doc_freshness"], GateNode)
+
+    @pytest.mark.parametrize(
+        "workflow_fn",
+        [build_workflow, improve_workflow, research_workflow, refine_workflow, create_workflow],
+        ids=["build", "improve", "research", "refine", "create"],
+    )
+    def test_edge_wiring(self, workflow_fn) -> None:
+        wf = workflow_fn()
+        edges = wf.edges
+        assert any(
+            e.source == "gate_qa"
+            and e.target == "gate_doc_freshness"
+            and e.condition == VerdictType.PROCEED
+            for e in edges
+        ), "missing gate_qa -> gate_doc_freshness PROCEED edge"
+        assert any(
+            e.source == "gate_doc_freshness"
+            and e.target == "gate_precheck"
+            and e.condition == VerdictType.PROCEED
+            for e in edges
+        ), "missing gate_doc_freshness -> gate_precheck PROCEED edge"
+        assert any(
+            e.source == "gate_doc_freshness"
+            and e.target == "builder"
+            and e.condition == VerdictType.RELOOP
+            for e in edges
+        ), "missing gate_doc_freshness -> builder RELOOP edge"
+
+
+# ── Builder → QA reachability audit ────────────────────────────
+
+
+def _workflows_with_builder() -> list[str]:
+    """Return names of workflows containing a Builder AgentNode."""
+    names = []
+    for name, wf in register_all().items():
+        if wf.terminal:
+            continue
+        has_builder = any(
+            isinstance(n, AgentNode) and n.role == AgentRole.BUILDER for n in wf.nodes.values()
+        )
+        if has_builder:
+            names.append(name)
+    return sorted(names)
+
+
+def _is_reachable(workflow_name: str, source_id: str, target_id: str) -> bool:
+    """Check if target_id is reachable from source_id via forward edges + fork targets."""
+    wf = register_all()[workflow_name]
+    adj: dict[str, list[str]] = defaultdict(list)
+    for edge in wf.edges:
+        adj[edge.source].append(edge.target)
+    # Include ForkNode targets as implicit edges for reachability
+    for nid, node in wf.nodes.items():
+        if isinstance(node, ForkNode):
+            adj[nid].extend(node.targets)
+
+    visited: set[str] = set()
+    queue: deque[str] = deque([source_id])
+    while queue:
+        nid = queue.popleft()
+        if nid == target_id:
+            return True
+        if nid in visited:
+            continue
+        visited.add(nid)
+        queue.extend(adj.get(nid, []))
+    return False
+
+
+DEEP_QA_ROLES = {AgentRole.HEALTH_CHECKER, AgentRole.CODE_REVIEWER, AgentRole.ADVERSARIAL_TESTER}
+
+
+class TestBuilderQaReachability:
+    """Every workflow with a Builder must also have a deep-qa specialist reachable from it."""
+
+    @pytest.mark.parametrize("workflow_name", _workflows_with_builder())
+    def test_builder_has_qa_node(self, workflow_name: str) -> None:
+        wf = register_all()[workflow_name]
+        qa_nodes = [
+            nid
+            for nid, n in wf.nodes.items()
+            if isinstance(n, AgentNode) and n.role in DEEP_QA_ROLES
+        ]
+        assert qa_nodes, (
+            f"workflow '{workflow_name}' has a Builder but no deep-qa specialist AgentNode"
+        )
+
+    @pytest.mark.parametrize("workflow_name", _workflows_with_builder())
+    def test_qa_reachable_from_builder(self, workflow_name: str) -> None:
+        wf = register_all()[workflow_name]
+        builder_ids = [
+            nid
+            for nid, n in wf.nodes.items()
+            if isinstance(n, AgentNode) and n.role == AgentRole.BUILDER
+        ]
+        qa_ids = [
+            nid
+            for nid, n in wf.nodes.items()
+            if isinstance(n, AgentNode) and n.role in DEEP_QA_ROLES
+        ]
+        for bid in builder_ids:
+            reachable = any(_is_reachable(workflow_name, bid, qid) for qid in qa_ids)
+            assert reachable, (
+                f"workflow '{workflow_name}': deep-qa specialist is not reachable from "
+                f"Builder node '{bid}' via edges"
+            )
+
+
+# ── Deep-QA subgraph tests ────────────────────────────────────
+
+
+DEEP_QA_NODE_IDS = {
+    "fork_qa",
+    "health_checker",
+    "code_reviewer",
+    "adversarial_tester",
+    "join_qa",
+}
+
+DEEP_QA_WORKFLOWS = ["build", "improve", "research", "refine", "create"]
+
+
+def _get_workflow(name: str):
+    return {
+        "build": build_workflow,
+        "improve": improve_workflow,
+        "research": research_workflow,
+        "refine": refine_workflow,
+        "create": create_workflow,
+    }[name]()
+
+
+class TestDeepQaSubgraph:
+    """Verify the parallel deep-QA subgraph is correctly wired in all 5 core workflows."""
+
+    @pytest.mark.parametrize("wf_name", DEEP_QA_WORKFLOWS)
+    def test_deep_qa_present_in_all_workflows(self, wf_name: str) -> None:
+        wf = _get_workflow(wf_name)
+        for node_id in DEEP_QA_NODE_IDS:
+            assert node_id in wf.nodes, f"workflow '{wf_name}' missing deep-qa node '{node_id}'"
+
+    @pytest.mark.parametrize("wf_name", DEEP_QA_WORKFLOWS)
+    def test_deep_qa_internal_edges(self, wf_name: str) -> None:
+        wf = _get_workflow(wf_name)
+        expected_edges = [
+            ("fork_qa", "join_qa", None),
+        ]
+        edge_set = {(e.source, e.target, e.condition) for e in wf.edges}
+        for src, tgt, cond in expected_edges:
+            assert (src, tgt, cond) in edge_set, (
+                f"workflow '{wf_name}' missing edge {src} → {tgt} ({cond})"
+            )
+
+    @pytest.mark.parametrize("wf_name", DEEP_QA_WORKFLOWS)
+    def test_deep_qa_fork_targets(self, wf_name: str) -> None:
+        wf = _get_workflow(wf_name)
+        fork = wf.nodes["fork_qa"]
+        assert isinstance(fork, ForkNode)
+        assert set(fork.targets) == {"health_checker", "code_reviewer", "adversarial_tester"}
+
+    @pytest.mark.parametrize("wf_name", DEEP_QA_WORKFLOWS)
+    def test_deep_qa_no_redundant_nodes(self, wf_name: str) -> None:
+        wf = _get_workflow(wf_name)
+        for removed in ("gate_health", "gate_adversarial", "join_verdict"):
+            assert removed not in wf.nodes, (
+                f"workflow '{wf_name}' still has removed node '{removed}'"
+            )
+
+    @pytest.mark.parametrize("wf_name", DEEP_QA_WORKFLOWS)
+    def test_gate_qa_reloop_preserved(self, wf_name: str) -> None:
+        wf = _get_workflow(wf_name)
+        reloop_edges = [
+            e
+            for e in wf.edges
+            if e.source == "gate_qa" and e.target == "builder" and e.condition == VerdictType.RELOOP
+        ]
+        assert len(reloop_edges) == 1, f"workflow '{wf_name}' missing gate_qa → builder RELOOP edge"
+
+    @pytest.mark.parametrize("wf_name", DEEP_QA_WORKFLOWS)
+    def test_no_monolithic_qa_node(self, wf_name: str) -> None:
+        """Verify the old monolithic 'qa' AgentNode was removed."""
+        wf = _get_workflow(wf_name)
+        assert "qa" not in wf.nodes or not isinstance(wf.nodes.get("qa"), AgentNode), (
+            f"workflow '{wf_name}' still has monolithic 'qa' AgentNode"
+        )
+
+
+class TestContributedWorkflows:
+    def test_register_all_includes_contributed(self) -> None:
+        """register_all() returns deep-qa and legacybench from contributed/."""
+        workflows = register_all()
+        assert "deep-qa" in workflows
+        assert "legacybench" in workflows
+
+    def test_contributed_workflows_valid(self) -> None:
+        workflows = register_all()
+        for name in ("deep-qa", "legacybench"):
+            wf = workflows[name]
+            issues = wf.validate_graph()
+            assert issues == [], f"{name} workflow has issues: {issues}"
+
+
+# ── Terminal flag defaults ──────────────────────────────────────
+
+
+class TestTerminalFlagDefaults:
+    """Standard workflows default to terminal=False."""
+
+    def test_build_not_terminal(self) -> None:
+        assert build_workflow().terminal is False
+
+    def test_improve_not_terminal(self) -> None:
+        assert improve_workflow().terminal is False
+
+    def test_research_not_terminal(self) -> None:
+        assert research_workflow().terminal is False
+
+    def test_meta_not_terminal(self) -> None:
+        assert meta_workflow().terminal is False
+
+    def test_design_is_terminal(self) -> None:
+        assert design_workflow().terminal is True
+
+
+# ── W₁₆: Founder structure ──────────────────────────────────────
+
+
+class TestFounderStructure:
+    def test_founder_valid(self) -> None:
+        wf = founder_workflow()
+        issues = wf.validate_graph()
+        assert issues == [], f"founder workflow has issues: {issues}"
+
+    def test_founder_name(self) -> None:
+        wf = founder_workflow()
+        assert wf.name == "founder"
+
+    def test_founder_terminal(self) -> None:
+        wf = founder_workflow()
+        assert wf.terminal is True
+
+    def test_founder_trigger(self) -> None:
+        wf = founder_workflow()
+        assert wf.trigger is not None
+        assert wf.trigger(ProjectState.HAS_FACTORY, {"mode": "founder"})
+        assert not wf.trigger(ProjectState.HAS_FACTORY, {})
+        assert not wf.trigger(ProjectState.NO_FACTORY, {"mode": "founder"})
+
+    def test_founder_node_count(self) -> None:
+        wf = founder_workflow()
+        assert len(wf.nodes) == 5
+
+    def test_founder_has_no_deep_qa(self) -> None:
+        wf = founder_workflow()
+        assert "health_checker" not in wf.nodes
+        assert "code_reviewer" not in wf.nodes
+        assert "adversarial_tester" not in wf.nodes
+
+    def test_founder_builder_max_iterations(self) -> None:
+        wf = founder_workflow()
+        builder = wf.nodes["builder"]
+        assert builder.max_iterations == 1
+
+    def test_founder_skill_export(self) -> None:
+        from factory.workflow.skill_export import validate_skill, workflow_to_skill_md
+
+        wf = founder_workflow()
+        skill_md = workflow_to_skill_md(wf)
+        issues = validate_skill(skill_md)
+        assert issues == [], f"founder skill has issues: {issues}"
+        assert "workflow-founder" in skill_md
+
+
+# ── W₁₁: Doc Generate structure ──────────────────────────────────
+
+
+class TestDocGenerateWorkflow:
+    def test_registered(self) -> None:
+        all_wf = register_all()
+        assert "doc-generate" in all_wf
+
+    def test_valid(self) -> None:
+        wf = doc_generate_workflow()
+        issues = wf.validate_graph()
+        assert issues == [], f"doc-generate workflow has issues: {issues}"
+
+    def test_name(self) -> None:
+        assert doc_generate_workflow().name == "doc-generate"
+
+    def test_start_node(self) -> None:
+        assert doc_generate_workflow().start_node == "scan_project"
+
+    def test_no_trigger(self) -> None:
+        assert doc_generate_workflow().trigger is None
+
+    @pytest.mark.parametrize(
+        "node_id,expected_type",
+        [
+            ("scan_project", AgentNode),
+            ("gate_scan", GateNode),
+            ("generate_docs", AgentNode),
+            ("gate_docs", GateNode),
+            ("validate_docs", FnNode),
+            ("gate_validate", GateNode),
+        ],
+    )
+    def test_node_exists_and_type(self, node_id: str, expected_type: type) -> None:
+        wf = doc_generate_workflow()
+        assert node_id in wf.nodes
+        assert isinstance(wf.nodes[node_id], expected_type)
+
+    def test_agent_nodes_use_researcher(self) -> None:
+        wf = doc_generate_workflow()
+        for nid in ("scan_project", "generate_docs"):
+            node = wf.nodes[nid]
+            assert isinstance(node, AgentNode)
+            assert node.role == AgentRole.RESEARCHER
+
+    @pytest.mark.parametrize(
+        "gate_id",
+        ["gate_scan", "gate_docs", "gate_validate"],
+    )
+    def test_gates_are_ceo_agent(self, gate_id: str) -> None:
+        wf = doc_generate_workflow()
+        gate = wf.nodes[gate_id]
+        assert isinstance(gate, GateNode)
+        assert gate.evaluator_type == "agent"
+        assert gate.evaluator_role == AgentRole.CEO
+
+    def test_linear_pipeline_edges(self) -> None:
+        wf = doc_generate_workflow()
+        edge_set = {(e.source, e.target, e.condition) for e in wf.edges}
+        expected = [
+            ("scan_project", "gate_scan", None),
+            ("gate_scan", "generate_docs", VerdictType.PROCEED),
+            ("generate_docs", "gate_docs", None),
+            ("gate_docs", "validate_docs", VerdictType.PROCEED),
+            ("validate_docs", "gate_validate", None),
+        ]
+        for src, tgt, cond in expected:
+            assert (src, tgt, cond) in edge_set, f"missing edge {src} -> {tgt} ({cond})"
+
+    def test_reloop_edges(self) -> None:
+        wf = doc_generate_workflow()
+        edge_set = {(e.source, e.target, e.condition) for e in wf.edges}
+        expected_reloops = [
+            ("gate_scan", "scan_project", VerdictType.RELOOP),
+            ("gate_docs", "generate_docs", VerdictType.RELOOP),
+            ("gate_validate", "validate_docs", VerdictType.RELOOP),
+        ]
+        for src, tgt, cond in expected_reloops:
+            assert (src, tgt, cond) in edge_set, f"missing reloop edge {src} -> {tgt}"
+
+
+# ── W₁₂: Doc Update structure ────────────────────────────────────
+
+
+class TestDocUpdateWorkflow:
+    def test_registered(self) -> None:
+        all_wf = register_all()
+        assert "doc-update" in all_wf
+
+    def test_valid(self) -> None:
+        wf = doc_update_workflow()
+        issues = wf.validate_graph()
+        assert issues == [], f"doc-update workflow has issues: {issues}"
+
+    def test_name(self) -> None:
+        assert doc_update_workflow().name == "doc-update"
+
+    def test_start_node(self) -> None:
+        assert doc_update_workflow().start_node == "diff_scope"
+
+    def test_no_trigger(self) -> None:
+        assert doc_update_workflow().trigger is None
+
+    @pytest.mark.parametrize(
+        "node_id,expected_type",
+        [
+            ("diff_scope", FnNode),
+            ("patch_docs", AgentNode),
+            ("gate_patch", GateNode),
+            ("revalidate", FnNode),
+            ("gate_revalidate", GateNode),
+        ],
+    )
+    def test_node_exists_and_type(self, node_id: str, expected_type: type) -> None:
+        wf = doc_update_workflow()
+        assert node_id in wf.nodes
+        assert isinstance(wf.nodes[node_id], expected_type)
+
+    def test_patch_docs_uses_researcher(self) -> None:
+        wf = doc_update_workflow()
+        node = wf.nodes["patch_docs"]
+        assert isinstance(node, AgentNode)
+        assert node.role == AgentRole.RESEARCHER
+
+    @pytest.mark.parametrize(
+        "gate_id",
+        ["gate_patch", "gate_revalidate"],
+    )
+    def test_gates_are_ceo_agent(self, gate_id: str) -> None:
+        wf = doc_update_workflow()
+        gate = wf.nodes[gate_id]
+        assert isinstance(gate, GateNode)
+        assert gate.evaluator_type == "agent"
+        assert gate.evaluator_role == AgentRole.CEO
+
+    def test_linear_pipeline_edges(self) -> None:
+        wf = doc_update_workflow()
+        edge_set = {(e.source, e.target, e.condition) for e in wf.edges}
+        expected = [
+            ("diff_scope", "patch_docs", None),
+            ("patch_docs", "gate_patch", None),
+            ("gate_patch", "revalidate", VerdictType.PROCEED),
+            ("revalidate", "gate_revalidate", None),
+        ]
+        for src, tgt, cond in expected:
+            assert (src, tgt, cond) in edge_set, f"missing edge {src} -> {tgt} ({cond})"
+
+    def test_reloop_edges(self) -> None:
+        wf = doc_update_workflow()
+        edge_set = {(e.source, e.target, e.condition) for e in wf.edges}
+        expected_reloops = [
+            ("gate_patch", "patch_docs", VerdictType.RELOOP),
+            ("gate_revalidate", "revalidate", VerdictType.RELOOP),
+        ]
+        for src, tgt, cond in expected_reloops:
+            assert (src, tgt, cond) in edge_set, f"missing reloop edge {src} -> {tgt}"
+
+
+# ── W₁₃: Founder Mode ───────────────────────────────────────────
+
+
+class TestFounderWorkflow:
+    def test_founder_workflow_graph(self) -> None:
+        wf = founder_workflow()
+        issues = wf.validate_graph()
+        assert issues == [], f"founder workflow has issues: {issues}"
+
+    def test_founder_workflow_registration(self) -> None:
+        all_wf = register_all()
+        assert "founder" in all_wf
+
+    def test_founder_workflow_trigger(self) -> None:
+        wf = founder_workflow()
+        assert wf.trigger is not None
+        assert wf.trigger(ProjectState.HAS_FACTORY, {"mode": "founder"})
+        assert not wf.trigger(ProjectState.HAS_FACTORY, {})
+        assert not wf.trigger(ProjectState.HAS_FACTORY, {"mode": "improve"})
+        assert not wf.trigger(ProjectState.NO_REPO, {"mode": "founder"})
+
+    def test_founder_name(self) -> None:
+        wf = founder_workflow()
+        assert wf.name == "founder"
+
+    def test_founder_is_terminal(self) -> None:
+        wf = founder_workflow()
+        assert wf.terminal is True
+
+    def test_founder_start_node(self) -> None:
+        wf = founder_workflow()
+        assert wf.start_node == "study"
+
+    def test_founder_has_no_deep_qa(self) -> None:
+        wf = founder_workflow()
+        for nid in ("health_checker", "code_reviewer", "adversarial_tester"):
+            assert nid not in wf.nodes, f"founder should not have {nid}"
+
+    def test_founder_nodes(self) -> None:
+        wf = founder_workflow()
+        assert "study" in wf.nodes
+        assert "strategist" in wf.nodes
+        assert "builder" in wf.nodes
+        assert "gate_tests" in wf.nodes
+        assert "finalize" in wf.nodes
+
+    def test_founder_gate_tests_is_fn(self) -> None:
+        wf = founder_workflow()
+        gate = wf.nodes["gate_tests"]
+        assert isinstance(gate, GateNode)
+        assert gate.evaluator_type == "fn"
+        assert "pytest" in gate.evaluator_command
+        assert "ruff" in gate.evaluator_command
+
+    def test_founder_finalize_uses_force(self) -> None:
+        wf = founder_workflow()
+        finalize = wf.nodes["finalize"]
+        assert isinstance(finalize, FnNode)
+        assert "--force" in finalize.command
+
+    def test_founder_reloop_to_builder(self) -> None:
+        wf = founder_workflow()
+        reloop_edges = [
+            e
+            for e in wf.edges
+            if e.source == "gate_tests"
+            and e.target == "builder"
+            and e.condition == VerdictType.RELOOP
+        ]
+        assert len(reloop_edges) == 1
+
+    def test_founder_skill_export(self) -> None:
+        from factory.workflow.skill_export import validate_skill, workflow_to_skill_md
+
+        wf = founder_workflow()
+        skill_md = workflow_to_skill_md(wf)
+        issues = validate_skill(skill_md)
+        assert issues == [], f"founder skill has issues: {issues}"
+        assert "workflow-founder" in skill_md
+
+
+# ── _study_subgraph focus threading ─────────────────────────────
+
+
+class TestStudySubgraphFocus:
+    def test_focus_sets_study_node(self) -> None:
+        nodes, _ = _study_subgraph(focus="auth")
+        assert nodes["study"].focus == "auth"
+
+    def test_focus_sets_graph_explorer_prompt(self) -> None:
+        nodes, _ = _study_subgraph(focus="auth")
+        assert "auth" in nodes["graph_explorer"].prompt_template
+
+    def test_no_focus_backward_compatible(self) -> None:
+        nodes, _ = _study_subgraph()
+        assert nodes["study"].focus is None
+        assert nodes["graph_explorer"].prompt_template == _GRAPH_EXPLORER_PROMPT
+
+    def test_graph_explorer_prompt_with_focus(self) -> None:
+        prompt = _graph_explorer_prompt("auth flow")
+        assert "Focus your exploration on: auth flow" in prompt
+        assert 'factory graph query "auth flow"' in prompt
+
+    def test_graph_explorer_prompt_without_focus(self) -> None:
+        assert _graph_explorer_prompt() == _GRAPH_EXPLORER_PROMPT
+        assert _graph_explorer_prompt(None) == _GRAPH_EXPLORER_PROMPT

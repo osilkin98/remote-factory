@@ -110,6 +110,20 @@
 #benchmark-dashboard .trend-up { color: #22863a; }
 #benchmark-dashboard .trend-down { color: #cb2431; }
 #benchmark-dashboard .trend-neutral { color: #888; }
+
+/* Trace analysis */
+#benchmark-dashboard .trace-analysis-row td { padding: 0 0.8rem 0.8rem 2rem; }
+#benchmark-dashboard .trace-content { font-family: var(--md-code-font-family, monospace); font-size: 0.8rem; background: rgba(128,128,128,0.1); padding: 0.8rem; border-radius: 4px; white-space: pre-wrap; max-height: 400px; overflow-y: auto; line-height: 1.5; }
+#benchmark-dashboard .trace-link { font-size: 0.8rem; margin-left: 0.5rem; opacity: 0.7; }
+#benchmark-dashboard .trace-link:hover { opacity: 1; }
+
+/* Pagination controls */
+#benchmark-dashboard .pagination { display: flex; justify-content: center; align-items: center; gap: 8px; margin: 16px 0; flex-wrap: wrap; }
+#benchmark-dashboard .pagination button { background: #2a2a3e; color: #e0e0e0; border: 1px solid #444; border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 0.85rem; }
+#benchmark-dashboard .pagination button:hover:not(:disabled) { background: #3a3a5e; }
+#benchmark-dashboard .pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
+#benchmark-dashboard .pagination button.active { background: #667eea; border-color: #667eea; }
+#benchmark-dashboard .pagination .page-info { color: #aaa; font-size: 0.85em; }
 </style>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -410,7 +424,7 @@ function renderAccuracyTrend(mainResults) {
             data: factoryPoints,
             borderColor: '#4285f4',
             backgroundColor: '#4285f4',
-            tension: 0.2,
+            tension: 0,
             pointRadius: 4,
           },
           {
@@ -418,7 +432,7 @@ function renderAccuracyTrend(mainResults) {
             data: claudePoints,
             borderColor: '#ff7043',
             backgroundColor: '#ff7043',
-            tension: 0.2,
+            tension: 0,
             pointRadius: 4,
           },
         ]
@@ -480,7 +494,7 @@ function renderDurationTrend(mainResults) {
             data: runAvgs.factoryDurationPoints,
             borderColor: '#4285f4',
             backgroundColor: '#4285f4',
-            tension: 0.2,
+            tension: 0,
             pointRadius: 4,
           },
           {
@@ -488,7 +502,7 @@ function renderDurationTrend(mainResults) {
             data: runAvgs.claudeDurationPoints,
             borderColor: '#ff7043',
             backgroundColor: '#ff7043',
-            tension: 0.2,
+            tension: 0,
             pointRadius: 4,
           },
         ]
@@ -554,7 +568,7 @@ function renderCostTrend(mainResults) {
             data: runAvgs.factoryCostPoints,
             borderColor: '#4285f4',
             backgroundColor: '#4285f4',
-            tension: 0.2,
+            tension: 0,
             pointRadius: 4,
           },
           {
@@ -562,7 +576,7 @@ function renderCostTrend(mainResults) {
             data: runAvgs.claudeCostPoints,
             borderColor: '#ff7043',
             backgroundColor: '#ff7043',
-            tension: 0.2,
+            tension: 0,
             pointRadius: 4,
           },
         ]
@@ -613,7 +627,7 @@ function renderPerBenchmarkTable(mainResults) {
   html += '<p class="section-explanation">Most recent main branch result for each benchmark and solver combination.</p>';
   html += '<table><thead><tr>';
   html += '<th>Benchmark</th><th>Solver</th><th>Result</th><th>Duration</th>';
-  html += '<th>Cost</th><th>Commit</th><th>Run</th>';
+  html += '<th>Cost</th><th>Trace</th><th>Commit</th><th>Run</th>';
   html += '</tr></thead><tbody>';
 
   for (const [, r] of combos) {
@@ -632,6 +646,13 @@ function renderPerBenchmarkTable(mainResults) {
     html += `<td>${statusIcon(r.resolved)} ${(r.score * 100).toFixed(0)}%</td>`;
     html += `<td>${formatDurationShort(r.duration_seconds)}</td>`;
     html += `<td>${formatCost(r.details?.cost_usd)}</td>`;
+    const traceSummary = r.trace_summary || '';
+    const escaped = traceSummary.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    const truncated = escaped.length > 80 ? escaped.substring(0, 77) + '...' : escaped;
+    const traceHtml = r.trace_url
+      ? '<a href="' + r.trace_url + '" title="' + traceSummary.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;') + '">' + (truncated || 'trace') + '</a>'
+      : (truncated || '—');
+    html += '<td>' + traceHtml + '</td>';
     html += `<td>${commitLink}</td>`;
     html += `<td>${runLink}</td>`;
     html += '</tr>';
@@ -641,13 +662,149 @@ function renderPerBenchmarkTable(mainResults) {
   return html;
 }
 
-// Section 6: Run History — flat rows with expandable details
+function formatTrendColumn(delta) {
+  if (!delta) return '<span class="trend-neutral">—</span>';
+  let parts = [];
+
+  const accVal = delta.accuracy;
+  if (Math.abs(accVal) >= 0.5) {
+    const sign = accVal > 0 ? '+' : '';
+    const cls = accVal > 0 ? 'trend-up' : 'trend-down';
+    const arrow = accVal > 0 ? '&#9650;' : '&#9660;';
+    parts.push(`<span class="${cls}">${arrow}${sign}${accVal.toFixed(0)}% acc</span>`);
+  }
+
+  const costVal = delta.cost;
+  if (Math.abs(costVal) >= 0.01) {
+    const sign = costVal > 0 ? '+' : '';
+    const cls = costVal > 0 ? 'trend-down' : 'trend-up';
+    const arrow = costVal > 0 ? '&#9650;' : '&#9660;';
+    parts.push(`<span class="${cls}">${arrow}${sign}$${costVal.toFixed(2)} cost</span>`);
+  }
+
+  const durVal = delta.duration;
+  if (Math.abs(durVal) >= 1) {
+    const sign = durVal > 0 ? '+' : '';
+    const cls = durVal > 0 ? 'trend-down' : 'trend-up';
+    const arrow = durVal > 0 ? '&#9650;' : '&#9660;';
+    parts.push(`<span class="${cls}">${arrow}${sign}${formatDurationShort(Math.abs(durVal))} dur</span>`);
+  }
+
+  return parts.length > 0 ? parts.join('<br>') : '<span class="trend-neutral">= no change</span>';
+}
+
+// Section 6: Run History — paginated with expandable details
+let currentPage = 1;
+const RUNS_PER_PAGE = 20;
+let allSortedRuns = [];
+
+function getFilteredRuns() {
+  const bv = document.getElementById('filter-benchmark')?.value || '';
+  const sv = document.getElementById('filter-solver')?.value || '';
+  return allSortedRuns.filter(run => {
+    const runBenchmarks = [...new Set(run.jobs.map(j => j.benchmark))];
+    const runSolvers = [...new Set(run.jobs.map(j => getSolver(j)))];
+    return (!bv || runBenchmarks.includes(bv)) && (!sv || runSolvers.includes(sv));
+  });
+}
+
+function renderPaginationControls(current, total, totalItems, startIdx, endIdx) {
+  if (totalItems === 0) return '<span class="page-info">No matching runs</span>';
+  if (total <= 1) return `<span class="page-info">Showing all ${totalItems} runs</span>`;
+
+  let html = `<span class="page-info">Showing runs ${startIdx + 1}–${endIdx} of ${totalItems}</span>`;
+  html += `<button class="page-btn" data-page="${current - 1}" ${current === 1 ? 'disabled' : ''}>← Prev</button>`;
+
+  const pages = [];
+  pages.push(1);
+  if (current > 3) pages.push('...');
+  for (let p = Math.max(2, current - 1); p <= Math.min(total - 1, current + 1); p++) {
+    pages.push(p);
+  }
+  if (current < total - 2) pages.push('...');
+  if (total > 1) pages.push(total);
+
+  for (const p of pages) {
+    if (p === '...') {
+      html += '<span class="page-info">…</span>';
+    } else {
+      html += `<button class="page-btn${p === current ? ' active' : ''}" data-page="${p}">${p}</button>`;
+    }
+  }
+
+  html += `<button class="page-btn" data-page="${current + 1}" ${current === total ? 'disabled' : ''}>Next →</button>`;
+  return html;
+}
+
+function updateRunHistoryTable() {
+  const filteredRuns = getFilteredRuns();
+  const totalPages = Math.max(1, Math.ceil(filteredRuns.length / RUNS_PER_PAGE));
+  if (currentPage > totalPages) currentPage = totalPages;
+
+  const start = (currentPage - 1) * RUNS_PER_PAGE;
+  const pageRuns = filteredRuns.slice(start, start + RUNS_PER_PAGE);
+
+  const bv = document.getElementById('filter-benchmark')?.value || '';
+  const sv = document.getElementById('filter-solver')?.value || '';
+
+  let rowsHtml = '';
+  for (const run of pageRuns) {
+    const rid = run.run_id.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const jobBenchmarks = [...new Set(run.jobs.map(j => j.benchmark))].join(',');
+    const jobSolvers = [...new Set(run.jobs.map(j => getSolver(j)))].join(',');
+
+    rowsHtml += `<tr class="run-summary" data-run-id="${rid}" data-benchmarks="${jobBenchmarks}" data-solvers="${jobSolvers}">`;
+    rowsHtml += `<td style="white-space:nowrap">${formatDate(run.date)}</td>`;
+    rowsHtml += `<td>${run.branch}</td>`;
+    rowsHtml += `<td>${run.score} (${run.passed}/${run.total})</td>`;
+    rowsHtml += `<td>${formatCost(run.totalCost)}</td>`;
+    rowsHtml += `<td>${formatDurationShort(run.maxDuration)}</td>`;
+    rowsHtml += `<td>${formatTrendColumn(run.delta)}</td>`;
+    rowsHtml += `<td><button class="toggle-details" data-target="${rid}">+</button></td>`;
+    rowsHtml += '</tr>';
+
+    for (const j of run.jobs) {
+      const solver = getSolver(j);
+      const matchB = !bv || j.benchmark === bv;
+      const matchS = !sv || solver === sv;
+      if (!matchB || !matchS) continue;
+      const runLink = j.run_url ? `<a href="${j.run_url}">link</a>` : '';
+      const traceLink = j.trace_url ? `<a href="${j.trace_url}" class="trace-link">trace</a>` : '';
+      rowsHtml += `<tr class="run-detail hidden" data-parent="${rid}" data-benchmark="${j.benchmark}" data-solver="${solver}">`;
+      rowsHtml += `<td>${j.benchmark}</td>`;
+      rowsHtml += `<td>${solver}</td>`;
+      rowsHtml += `<td>${statusIcon(j.resolved)} ${(j.score * 100).toFixed(0)}%</td>`;
+      rowsHtml += `<td>${formatCost(j.details?.cost_usd)}</td>`;
+      rowsHtml += `<td>${formatDurationShort(j.duration_seconds)}</td>`;
+      rowsHtml += `<td></td>`;
+      rowsHtml += `<td>${runLink}${traceLink ? ' ' + traceLink : ''}</td>`;
+      rowsHtml += '</tr>';
+      if (j.trace_analysis) {
+        const analysisTraceLink = j.trace_url ? ' <a href="' + j.trace_url + '" class="trace-link">View in Langfuse →</a>' : '';
+        rowsHtml += `<tr class="run-detail trace-analysis-row hidden" data-parent="${rid}">`;
+        rowsHtml += '<td colspan="7"><details><summary>Trace Analysis' + analysisTraceLink + '</summary>';
+        rowsHtml += '<div class="trace-content">' + j.trace_analysis.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>') + '</div>';
+        rowsHtml += '</details></td></tr>';
+      }
+    }
+  }
+
+  const tbody = document.getElementById('history-tbody');
+  if (tbody) tbody.innerHTML = rowsHtml;
+
+  const endIdx = start + pageRuns.length;
+  const paginationHtml = renderPaginationControls(currentPage, totalPages, filteredRuns.length, start, endIdx);
+  const pTop = document.getElementById('pagination-top');
+  const pBottom = document.getElementById('pagination-bottom');
+  if (pTop) pTop.innerHTML = paginationHtml;
+  if (pBottom) pBottom.innerHTML = paginationHtml;
+}
+
 function renderRunHistory(allResults) {
   const benchmarks = [...new Set(allResults.map(r => r.benchmark))].sort();
   const solvers = [...new Set(allResults.map(r => getSolver(r)))].sort();
   const sortedRuns = groupByRunId(allResults);
 
-  // Compute trend deltas vs prior run
   for (let i = 0; i < sortedRuns.length; i++) {
     const run = sortedRuns[i];
     const prev = sortedRuns[i + 1];
@@ -662,39 +819,8 @@ function renderRunHistory(allResults) {
     };
   }
 
-  function formatTrendColumn(delta) {
-    if (!delta) return '<span class="trend-neutral">—</span>';
-    let parts = [];
-
-    // Accuracy: higher is better (normal colors)
-    const accVal = delta.accuracy;
-    if (Math.abs(accVal) >= 0.5) {
-      const sign = accVal > 0 ? '+' : '';
-      const cls = accVal > 0 ? 'trend-up' : 'trend-down';
-      const arrow = accVal > 0 ? '&#9650;' : '&#9660;';
-      parts.push(`<span class="${cls}">${arrow}${sign}${accVal.toFixed(0)}% acc</span>`);
-    }
-
-    // Cost: lower is better (inverted colors)
-    const costVal = delta.cost;
-    if (Math.abs(costVal) >= 0.01) {
-      const sign = costVal > 0 ? '+' : '';
-      const cls = costVal > 0 ? 'trend-down' : 'trend-up';
-      const arrow = costVal > 0 ? '&#9650;' : '&#9660;';
-      parts.push(`<span class="${cls}">${arrow}${sign}$${costVal.toFixed(2)} cost</span>`);
-    }
-
-    // Duration: lower is better (inverted colors)
-    const durVal = delta.duration;
-    if (Math.abs(durVal) >= 1) {
-      const sign = durVal > 0 ? '+' : '';
-      const cls = durVal > 0 ? 'trend-down' : 'trend-up';
-      const arrow = durVal > 0 ? '&#9650;' : '&#9660;';
-      parts.push(`<span class="${cls}">${arrow}${sign}${formatDurationShort(Math.abs(durVal))} dur</span>`);
-    }
-
-    return parts.length > 0 ? parts.join('<br>') : '<span class="trend-neutral">= no change</span>';
-  }
+  allSortedRuns = sortedRuns;
+  currentPage = 1;
 
   let html = '<div class="section-title">Run History</div>';
   html += '<p class="section-explanation">All benchmark runs, newest first. Trend arrows compare each run against the immediately preceding run. Green = improvement, red = regression.</p>';
@@ -708,45 +834,16 @@ function renderRunHistory(allResults) {
   html += '</select></label>';
   html += '</div>';
 
+  html += '<div id="pagination-top" class="pagination"></div>';
   html += '<table id="history-table"><thead><tr>';
   html += '<th>Date</th><th>Branch</th><th>Pass Rate</th>';
   html += '<th>Cost</th><th>Duration</th><th>Trend</th><th></th>';
-  html += '</tr></thead><tbody>';
-
-  for (const run of sortedRuns) {
-    const rid = run.run_id.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const jobBenchmarks = [...new Set(run.jobs.map(j => j.benchmark))].join(',');
-    const jobSolvers = [...new Set(run.jobs.map(j => getSolver(j)))].join(',');
-
-    html += `<tr class="run-summary" data-run-id="${rid}" data-benchmarks="${jobBenchmarks}" data-solvers="${jobSolvers}">`;
-    html += `<td style="white-space:nowrap">${formatDate(run.date)}</td>`;
-    html += `<td>${run.branch}</td>`;
-    html += `<td>${run.score} (${run.passed}/${run.total})</td>`;
-    html += `<td>${formatCost(run.totalCost)}</td>`;
-    html += `<td>${formatDurationShort(run.maxDuration)}</td>`;
-    html += `<td>${formatTrendColumn(run.delta)}</td>`;
-    html += `<td><button class="toggle-details" data-target="${rid}">+</button></td>`;
-    html += '</tr>';
-
-    for (const j of run.jobs) {
-      const solver = getSolver(j);
-      const runLink = j.run_url ? `<a href="${j.run_url}">link</a>` : '';
-      html += `<tr class="run-detail hidden" data-parent="${rid}" data-benchmark="${j.benchmark}" data-solver="${solver}">`;
-      html += `<td>${j.benchmark}</td>`;
-      html += `<td>${solver}</td>`;
-      html += `<td>${statusIcon(j.resolved)} ${(j.score * 100).toFixed(0)}%</td>`;
-      html += `<td>${formatCost(j.details?.cost_usd)}</td>`;
-      html += `<td>${formatDurationShort(j.duration_seconds)}</td>`;
-      html += `<td></td>`;
-      html += `<td>${runLink}</td>`;
-      html += '</tr>';
-    }
-  }
-
-  html += '</tbody></table>';
+  html += '</tr></thead><tbody id="history-tbody"></tbody></table>';
+  html += '<div id="pagination-bottom" class="pagination"></div>';
 
   setTimeout(() => {
-    // Toggle detail rows
+    updateRunHistoryTable();
+
     document.addEventListener('click', (e) => {
       const btn = e.target.closest('.toggle-details');
       if (!btn) return;
@@ -757,39 +854,20 @@ function renderRunHistory(allResults) {
       btn.textContent = isHidden ? '−' : '+';
     });
 
-    // Filters
+    document.addEventListener('click', (e) => {
+      const btn = e.target.closest('.page-btn');
+      if (!btn || btn.disabled) return;
+      const page = parseInt(btn.dataset.page);
+      if (page && page !== currentPage) {
+        currentPage = page;
+        updateRunHistoryTable();
+      }
+    });
+
     const benchSelect = document.getElementById('filter-benchmark');
     const solverSelect = document.getElementById('filter-solver');
-    if (!benchSelect || !solverSelect) return;
-
-    function applyFilters() {
-      const bv = benchSelect.value;
-      const sv = solverSelect.value;
-
-      const summaryRows = document.querySelectorAll('#history-table .run-summary');
-      for (const row of summaryRows) {
-        const rowBenchmarks = (row.dataset.benchmarks || '').split(',');
-        const rowSolvers = (row.dataset.solvers || '').split(',');
-        const matchB = !bv || rowBenchmarks.includes(bv);
-        const matchS = !sv || rowSolvers.includes(sv);
-        row.style.display = (matchB && matchS) ? '' : 'none';
-
-        const runId = row.dataset.runId;
-        const detailRows = document.querySelectorAll(`.run-detail[data-parent="${runId}"]`);
-        for (const dr of detailRows) {
-          const dMatchB = !bv || dr.dataset.benchmark === bv;
-          const dMatchS = !sv || dr.dataset.solver === sv;
-          if (matchB && matchS) {
-            dr.style.display = (dMatchB && dMatchS) ? (dr.classList.contains('hidden') ? 'none' : '') : 'none';
-          } else {
-            dr.style.display = 'none';
-          }
-        }
-      }
-    }
-
-    benchSelect.addEventListener('change', applyFilters);
-    solverSelect.addEventListener('change', applyFilters);
+    if (benchSelect) benchSelect.addEventListener('change', () => { currentPage = 1; updateRunHistoryTable(); });
+    if (solverSelect) solverSelect.addEventListener('change', () => { currentPage = 1; updateRunHistoryTable(); });
   }, 0);
 
   return html;

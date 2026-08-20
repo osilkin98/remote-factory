@@ -25,7 +25,7 @@ from unittest.mock import patch
 
 import pytest
 
-from factory.agents.runner import invoke_agent, reset_failure_counter
+from factory.agents.runner import invoke_agent
 from factory.runners import get_all_runner_meta, get_available_runners, get_runner
 
 _DRY_RUN_VARS = ["FACTORY_BOB_DRY_RUN", "FACTORY_CODEX_DRY_RUN", "FACTORY_OPENCODE_DRY_RUN"]
@@ -34,8 +34,10 @@ _DRY_RUN_VARS = ["FACTORY_BOB_DRY_RUN", "FACTORY_CODEX_DRY_RUN", "FACTORY_OPENCO
 @pytest.fixture(autouse=True)
 def _e2e_env_reset() -> None:
     """Clear dry-run flags and reset failure counter for e2e tests."""
+    import factory.agents.runner as runner_mod
+
     saved = {k: os.environ.pop(k, None) for k in _DRY_RUN_VARS}
-    reset_failure_counter()
+    runner_mod._consecutive_failures = 0
     yield  # type: ignore[misc]
     time.sleep(1)
     for k, v in saved.items():
@@ -43,7 +45,7 @@ def _e2e_env_reset() -> None:
             os.environ[k] = v
         else:
             os.environ.pop(k, None)
-    reset_failure_counter()
+    runner_mod._consecutive_failures = 0
 
 
 # ── auth detection ──────────────────────────────────────────────
@@ -60,43 +62,9 @@ def _runner_has_auth(name: str) -> bool:
     if not meta.is_available():
         return False
 
-    if name == "bob":
-        # Bob stores auth in ~/.bob/, not env vars — if the binary responds, it's authed
-        try:
-            result = subprocess.run(
-                ["bob", "--version"],
-                capture_output=True, text=True, timeout=10,
-            )
-            return result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return False
+    if name != "claude":
+        return False
 
-    if name == "codex":
-        # Codex uses ChatGPT OAuth — check via login status
-        if os.environ.get("CODEX_API_KEY") or os.environ.get("OPENAI_API_KEY"):
-            return True
-        try:
-            result = subprocess.run(
-                ["codex", "login", "status"],
-                capture_output=True, text=True, timeout=10,
-            )
-            return result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return False
-
-    if name == "opencode":
-        if os.environ.get("OPENAI_API_KEY"):
-            return True
-        try:
-            result = subprocess.run(
-                ["zsh", "-c", "source ~/.zshrc 2>/dev/null && echo $OPENAI_API_KEY"],
-                capture_output=True, text=True, timeout=5,
-            )
-            return bool(result.stdout.strip())
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return False
-
-    # Claude — if binary is available, auth is handled by the CLI itself
     return True
 
 
@@ -123,42 +91,42 @@ def sample_project(tmp_path: Path) -> Path:
     """Create a realistic sample Python project with .factory/ config."""
     # main.py — simple CLI with argparse
     (tmp_path / "main.py").write_text(
-        'import argparse\n'
-        'from utils import format_name, validate_positive\n'
-        '\n'
-        '\n'
-        'def greet(name: str) -> str:\n'
+        "import argparse\n"
+        "from utils import format_name, validate_positive\n"
+        "\n"
+        "\n"
+        "def greet(name: str) -> str:\n"
         '    return f"Hello, {format_name(name)}!"\n'
-        '\n'
-        '\n'
-        'def add(a: int, b: int) -> int:\n'
-        '    validate_positive(a)\n'
-        '    validate_positive(b)\n'
-        '    return a + b\n'
-        '\n'
-        '\n'
-        'def main() -> None:\n'
+        "\n"
+        "\n"
+        "def add(a: int, b: int) -> int:\n"
+        "    validate_positive(a)\n"
+        "    validate_positive(b)\n"
+        "    return a + b\n"
+        "\n"
+        "\n"
+        "def main() -> None:\n"
         '    parser = argparse.ArgumentParser(description="Sample CLI")\n'
         '    parser.add_argument("name", help="Name to greet")\n'
         '    parser.add_argument("--add", nargs=2, type=int, help="Two numbers to add")\n'
-        '    args = parser.parse_args()\n'
-        '    print(greet(args.name))\n'
-        '    if args.add:\n'
+        "    args = parser.parse_args()\n"
+        "    print(greet(args.name))\n"
+        "    if args.add:\n"
         '        print(f"Sum: {add(*args.add)}")\n'
-        '\n'
-        '\n'
+        "\n"
+        "\n"
         'if __name__ == "__main__":\n'
-        '    main()\n'
+        "    main()\n"
     )
 
     # utils.py — helper functions
     (tmp_path / "utils.py").write_text(
-        'def format_name(name: str) -> str:\n'
-        '    return name.strip().title()\n'
-        '\n'
-        '\n'
-        'def validate_positive(n: int) -> None:\n'
-        '    if n < 0:\n'
+        "def format_name(name: str) -> str:\n"
+        "    return name.strip().title()\n"
+        "\n"
+        "\n"
+        "def validate_positive(n: int) -> None:\n"
+        "    if n < 0:\n"
         '        raise ValueError(f"Expected positive number, got {n}")\n'
     )
 
@@ -166,99 +134,117 @@ def sample_project(tmp_path: Path) -> Path:
     tests_dir = tmp_path / "tests"
     tests_dir.mkdir()
     (tests_dir / "test_main.py").write_text(
-        'from main import greet, add\n'
-        '\n'
-        '\n'
-        'def test_greet():\n'
+        "from main import greet, add\n"
+        "\n"
+        "\n"
+        "def test_greet():\n"
         '    assert greet("alice") == "Hello, Alice!"\n'
-        '\n'
-        '\n'
-        'def test_greet_strips_whitespace():\n'
+        "\n"
+        "\n"
+        "def test_greet_strips_whitespace():\n"
         '    assert greet("  bob  ") == "Hello, Bob!"\n'
-        '\n'
-        '\n'
-        'def test_add():\n'
-        '    assert add(2, 3) == 5\n'
-        '\n'
-        '\n'
-        'def test_add_rejects_negative():\n'
-        '    import pytest\n'
-        '    with pytest.raises(ValueError):\n'
-        '        add(-1, 2)\n'
+        "\n"
+        "\n"
+        "def test_add():\n"
+        "    assert add(2, 3) == 5\n"
+        "\n"
+        "\n"
+        "def test_add_rejects_negative():\n"
+        "    import pytest\n"
+        "    with pytest.raises(ValueError):\n"
+        "        add(-1, 2)\n"
     )
 
     # pyproject.toml
     (tmp_path / "pyproject.toml").write_text(
-        '[project]\n'
+        "[project]\n"
         'name = "sample-project"\n'
         'version = "0.1.0"\n'
         'requires-python = ">=3.11"\n'
-        '\n'
-        '[tool.pytest.ini_options]\n'
+        "\n"
+        "[tool.pytest.ini_options]\n"
         'testpaths = ["tests"]\n'
     )
 
     # README.md
     (tmp_path / "README.md").write_text(
-        "# Sample Project\n\n"
-        "A simple CLI that greets users and adds numbers.\n"
+        "# Sample Project\n\nA simple CLI that greets users and adds numbers.\n"
     )
 
     # .factory/ config
     factory_dir = tmp_path / ".factory"
     factory_dir.mkdir()
-    (factory_dir / "config.json").write_text(json.dumps({
-        "goal": "A sample CLI for testing",
-        "scope": ["main.py", "utils.py", "tests/"],
-        "guards": [],
-        "eval_command": f"cd {tmp_path} && python -m pytest tests/ -q --tb=no",
-        "eval_threshold": 0.5,
-        "constraints": [],
-    }))
+    (factory_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "goal": "A sample CLI for testing",
+                "scope": ["main.py", "utils.py", "tests/"],
+                "guards": [],
+                "eval_command": f"cd {tmp_path} && python -m pytest tests/ -q --tb=no",
+                "eval_threshold": 0.5,
+                "constraints": [],
+            }
+        )
+    )
 
     # eval_profile.json — minimal profile for eval/agent CLI tests
-    (factory_dir / "eval_profile.json").write_text(json.dumps({
-        "project_type": "python",
-        "dimensions": [
+    (factory_dir / "eval_profile.json").write_text(
+        json.dumps(
             {
-                "name": "tests",
-                "command": f"cd {tmp_path} && python -m pytest tests/ -q --tb=no",
-                "weight": 0.7,
-                "parser": "exit_code",
-                "description": "Run test suite",
-                "source": "discovered",
-            },
-            {
-                "name": "lint",
-                "command": "echo 'lint ok'",
-                "weight": 0.3,
-                "parser": "exit_code",
-                "description": "Lint check",
-                "source": "fallback",
-            },
-        ],
-        "tier": "discovered",
-        "confidence": 0.8,
-        "human_reviewed": True,
-    }))
+                "project_type": "python",
+                "dimensions": [
+                    {
+                        "name": "tests",
+                        "command": f"cd {tmp_path} && python -m pytest tests/ -q --tb=no",
+                        "weight": 0.7,
+                        "parser": "exit_code",
+                        "description": "Run test suite",
+                        "source": "discovered",
+                    },
+                    {
+                        "name": "lint",
+                        "command": "echo 'lint ok'",
+                        "weight": 0.3,
+                        "parser": "exit_code",
+                        "description": "Lint check",
+                        "source": "fallback",
+                    },
+                ],
+                "tier": "discovered",
+                "confidence": 0.8,
+                "human_reviewed": True,
+            }
+        )
+    )
 
     # .factory/reviews/ for output capture
     (factory_dir / "reviews").mkdir()
 
     # Initialize git repo (agents need git)
     subprocess.run(
-        ["git", "init"], cwd=tmp_path,
-        capture_output=True, check=True,
+        ["git", "init"],
+        cwd=tmp_path,
+        capture_output=True,
+        check=True,
     )
     subprocess.run(
-        ["git", "add", "."], cwd=tmp_path,
-        capture_output=True, check=True,
+        ["git", "add", "."],
+        cwd=tmp_path,
+        capture_output=True,
+        check=True,
     )
     subprocess.run(
         ["git", "commit", "-m", "initial commit"],
-        cwd=tmp_path, capture_output=True, check=True,
-        env={**os.environ, "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@test.com",
-             "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@test.com"},
+        cwd=tmp_path,
+        capture_output=True,
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@test.com",
+            "GIT_COMMITTER_NAME": "test",
+            "GIT_COMMITTER_EMAIL": "test@test.com",
+        },
     )
 
     return tmp_path
@@ -291,27 +277,21 @@ def test_runners_list_json() -> None:
     assert code == 0
     data = json.loads(buf.getvalue())
     assert isinstance(data, list)
-    assert len(data) >= 4
+    assert len(data) >= 1
     names = {r["name"] for r in data}
     assert "claude" in names
-    assert "bob" in names
-    assert "codex" in names
-    assert "opencode" in names
 
 
 def test_get_available_runners_includes_all_builtins() -> None:
-    """get_available_runners includes all 4 built-in runners."""
+    """get_available_runners includes the claude runner."""
     runners = get_available_runners()
     assert "claude" in runners
-    assert "bob" in runners
-    assert "codex" in runners
-    assert "opencode" in runners
 
 
 def test_runner_metadata_consistency() -> None:
     """All runners have consistent metadata."""
     meta_list = get_all_runner_meta()
-    assert len(meta_list) >= 4
+    assert len(meta_list) >= 1
 
     names = set()
     for m in meta_list:
@@ -356,9 +336,7 @@ def test_capability_matrix() -> None:
 )
 def test_available_runners_detected() -> None:
     """At least one runner is detected as available and authenticated."""
-    assert len(AVAILABLE_RUNNERS) > 0, (
-        "No runners detected — auth detection may be broken"
-    )
+    assert len(AVAILABLE_RUNNERS) > 0, "No runners detected — auth detection may be broken"
 
 
 # ── slow tests (real API calls) ─────────────────────────────────
@@ -462,6 +440,7 @@ async def test_claude_usage_telemetry(sample_project: Path) -> None:
     """Claude runner returns usage telemetry (input/output tokens)."""
     runner = get_runner("claude")
     from factory.models import AgentRunRequest
+
     request = AgentRunRequest(
         prompt="You are a code assistant. Be concise.",
         task="What does main.py do? One sentence.",
@@ -480,8 +459,8 @@ async def test_claude_usage_telemetry(sample_project: Path) -> None:
 
 
 @pytest.mark.slow
-async def test_tmux_persist_degrades_for_non_claude(sample_project: Path) -> None:
-    """tmux_persist=True on non-Claude runners warns but doesn't crash."""
+async def test_tmux_persist_errors_for_non_claude(sample_project: Path) -> None:
+    """tmux_persist=True on non-Claude runners returns code 1 with an error message."""
     for name in AVAILABLE_RUNNERS:
         if name == "claude":
             continue
@@ -493,9 +472,12 @@ async def test_tmux_persist_degrades_for_non_claude(sample_project: Path) -> Non
             timeout=60.0,
             tmux_persist=True,
         )
-        assert code == 0, (
-            f"{name} should succeed despite unsupported tmux_persist "
+        assert code == 1, (
+            f"{name} should fail with code 1 for unsupported tmux_persist "
             f"(code={code}): {stdout[:200]}"
+        )
+        assert "not supported" in stdout.lower(), (
+            f"{name} should mention 'not supported' in error output: {stdout[:200]}"
         )
 
 
@@ -526,7 +508,7 @@ async def test_headless_produces_output(runner_name: str, sample_project: Path) 
 
 
 def _cli_env() -> dict[str, str]:
-    """Build subprocess env with PATH that includes ~/go/bin for opencode."""
+    """Build subprocess env with PATH additions for runner discovery."""
     env = os.environ.copy()
     go_bin = str(Path.home() / "go" / "bin")
     if go_bin not in env.get("PATH", ""):
@@ -535,7 +517,9 @@ def _cli_env() -> dict[str, str]:
         try:
             result = subprocess.run(
                 ["zsh", "-c", "source ~/.zshrc 2>/dev/null && echo $OPENAI_API_KEY"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             key = result.stdout.strip()
             if key:
@@ -552,16 +536,21 @@ def _cli_env() -> dict[str, str]:
 def test_factory_agent_cli_per_runner(runner_name: str, sample_project: Path) -> None:
     """factory agent researcher via CLI subprocess for each runner."""
     env = _cli_env()
-    if runner_name == "codex":
-        env.pop("OPENAI_API_KEY", None)
-        env.pop("CODEX_API_KEY", None)
     result = subprocess.run(
         [
-            "uv", "run", "factory", "agent", "researcher",
-            "--task", "List files in this project. Be concise.",
-            "--runner", runner_name,
-            "--project", str(sample_project),
-            "--timeout", "60",
+            "uv",
+            "run",
+            "factory",
+            "agent",
+            "researcher",
+            "--task",
+            "List files in this project. Be concise.",
+            "--runner",
+            runner_name,
+            "--project",
+            str(sample_project),
+            "--timeout",
+            "60",
         ],
         cwd=sample_project,
         capture_output=True,
@@ -609,14 +598,11 @@ def test_factory_runners_list_all_present() -> None:
         text=True,
         timeout=30,
     )
-    assert result.returncode == 0, (
-        f"factory runners list --json failed: {result.stderr[:300]}"
-    )
+    assert result.returncode == 0, f"factory runners list --json failed: {result.stderr[:300]}"
     data = json.loads(result.stdout)
     assert isinstance(data, list)
     names = {r["name"] for r in data}
-    for expected in ("claude", "bob", "codex", "opencode"):
-        assert expected in names, f"runner '{expected}' missing from list"
+    assert "claude" in names, "runner 'claude' missing from list"
     for runner in data:
         assert "name" in runner
         assert "display_name" in runner

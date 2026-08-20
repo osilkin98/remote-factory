@@ -3,18 +3,18 @@
 import csv
 import io
 import json
-import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any
 
 import structlog
 from filelock import FileLock
 from pydantic import ValidationError
 
 from factory.models import (
+    AdversarialComponent,
+    AdversarialConfig,
     AggregateMethod,
-    CompositeScore,
     CostBudgetConfig,
     EvalProfile,
     EvalWeights,
@@ -24,6 +24,7 @@ from factory.models import (
     HypothesisBudget,
     InnerLoopConfig,
     OuterLoopConfig,
+    ParallelConfig,
     ProjectEvalDimension,
     ResearchTarget,
     TierWeights,
@@ -48,9 +49,19 @@ def ensure_factory_dir(path: Path) -> None:
 
 
 TSV_COLUMNS = [
-    "id", "timestamp", "hypothesis", "change_summary", "issue_number",
-    "pr_number", "score_before", "score_after", "delta", "verdict",
-    "cost_usd", "notes", "research_citations",
+    "id",
+    "timestamp",
+    "hypothesis",
+    "change_summary",
+    "issue_number",
+    "pr_number",
+    "score_before",
+    "score_after",
+    "delta",
+    "verdict",
+    "cost_usd",
+    "notes",
+    "research_citations",
 ]
 
 
@@ -94,14 +105,16 @@ def _parse_project_eval(items: str | list[str] | float) -> list[ProjectEvalDimen
         command = fields.get("command", "")
         if not name or not command:
             continue
-        dims.append(ProjectEvalDimension(
-            name=name,
-            command=command,
-            parse=fields.get("parse", "json"),  # type: ignore[arg-type]
-            weight=float(fields.get("weight", "1.0")),
-            timeout=float(fields.get("timeout", "300")),
-            description=fields.get("description", ""),
-        ))
+        dims.append(
+            ProjectEvalDimension(
+                name=name,
+                command=command,
+                parse=fields.get("parse", "json"),  # type: ignore[arg-type]
+                weight=float(fields.get("weight", "1.0")),
+                timeout=float(fields.get("timeout", "300")),
+                description=fields.get("description", ""),
+            )
+        )
     return dims
 
 
@@ -152,12 +165,12 @@ def _parse_inner_loop(items: str | list[str] | float) -> InnerLoopConfig | None:
         aggregate=AggregateMethod(str(kv.get("aggregate", "mean"))),
         plateau_threshold=int(str(kv.get("plateau_threshold", "3"))),
         max_inner_runs_per_cycle=(
-            int(str(kv["max_inner_runs_per_cycle"]))
-            if "max_inner_runs_per_cycle" in kv
-            else None
+            int(str(kv["max_inner_runs_per_cycle"])) if "max_inner_runs_per_cycle" in kv else None
         ),
     )
-    log.debug("inner_loop_parsed", runs_per_cycle=config.runs_per_cycle, aggregate=config.aggregate.value)
+    log.debug(
+        "inner_loop_parsed", runs_per_cycle=config.runs_per_cycle, aggregate=config.aggregate.value
+    )
     return config
 
 
@@ -217,11 +230,13 @@ def _parse_hard_constraints(items: str | list[str] | float) -> list[HardConstrai
         check = fields.get("check", "")
         if not name or not check:
             continue
-        constraints.append(HardConstraint(
-            name=name,
-            check=check,
-            description=fields.get("description", ""),
-        ))
+        constraints.append(
+            HardConstraint(
+                name=name,
+                check=check,
+                description=fields.get("description", ""),
+            )
+        )
     return constraints
 
 
@@ -235,6 +250,108 @@ def _parse_tier_weights(items: str | list[str] | float) -> TierWeights | None:
     if not filtered:
         return None
     return TierWeights(**filtered)
+
+
+def _parse_adversarial(items: str | list[str] | float) -> AdversarialConfig | None:
+    """Parse adversarial config from factory.md.
+
+    Expects dot-notation key-value pairs like:
+      - generator.eval_command: python eval/score_gen.py
+      - generator.metric_name: evasion_rate
+      - generator.threshold: 0.4
+      - discriminator.eval_command: python eval/score_disc.py
+      - discriminator.metric_name: recall_specificity
+      - discriminator.threshold: 0.8
+      - hysteresis: 3
+      - convergence_window: 5
+    """
+    if not isinstance(items, list):
+        return None
+
+    gen_kv: dict[str, str] = {}
+    disc_kv: dict[str, str] = {}
+    top_kv: dict[str, str] = {}
+
+    for item in items:
+        s = str(item).strip()
+        if ":" not in s:
+            continue
+        key, val = s.split(":", 1)
+        key = key.strip()
+        val = val.strip()
+        if key.startswith("generator."):
+            gen_kv[key.removeprefix("generator.")] = val
+        elif key.startswith("discriminator."):
+            disc_kv[key.removeprefix("discriminator.")] = val
+        else:
+            top_kv[key] = val
+
+    if not gen_kv.get("eval_command") or not disc_kv.get("eval_command"):
+        return None
+
+    try:
+        generator = AdversarialComponent(
+            role="generator",
+            eval_command=gen_kv["eval_command"],
+            metric_name=gen_kv.get("metric_name", "generator_score"),
+            threshold=float(gen_kv.get("threshold", "0.5")),
+            scope=[s.strip() for s in gen_kv.get("scope", "").split(",") if s.strip()],
+            timeout=float(gen_kv.get("timeout", "300")),
+        )
+        discriminator = AdversarialComponent(
+            role="discriminator",
+            eval_command=disc_kv["eval_command"],
+            metric_name=disc_kv.get("metric_name", "discriminator_score"),
+            threshold=float(disc_kv.get("threshold", "0.5")),
+            scope=[s.strip() for s in disc_kv.get("scope", "").split(",") if s.strip()],
+            timeout=float(disc_kv.get("timeout", "300")),
+        )
+        config = AdversarialConfig(
+            generator=generator,
+            discriminator=discriminator,
+            hysteresis=int(top_kv.get("hysteresis", "3")),
+            max_rounds=int(top_kv["max_rounds"]) if "max_rounds" in top_kv else None,
+            convergence_window=int(top_kv.get("convergence_window", "5")),
+        )
+        log.debug(
+            "adversarial_parsed",
+            gen_cmd=generator.eval_command,
+            disc_cmd=discriminator.eval_command,
+            hysteresis=config.hysteresis,
+        )
+        return config
+    except (ValueError, KeyError, TypeError) as exc:
+        log.warning("adversarial_parse_failed", error=str(exc))
+        return None
+
+
+def _parse_parallel(items: str | list[str] | float) -> ParallelConfig | None:
+    """Parse parallel experiments config from factory.md."""
+    if not items:
+        return None
+    lines = items if isinstance(items, list) else [str(items)]
+    kwargs: dict[str, Any] = {}
+    for line in lines:
+        line = str(line).strip()
+        if ":" in line:
+            key, _, val = line.partition(":")
+            key = key.strip().lower().replace(" ", "_")
+            val = val.strip()
+            if key == "parallel_hypotheses":
+                try:
+                    kwargs["parallel_hypotheses"] = int(val)
+                except ValueError:
+                    pass
+            elif key == "selection_strategy":
+                if val in ("best_score",):
+                    kwargs["selection_strategy"] = val
+    if not kwargs:
+        return None
+    try:
+        return ParallelConfig(**kwargs)
+    except (ValueError, TypeError) as exc:
+        log.warning("parallel_parse_failed", error=str(exc))
+        return None
 
 
 class ExperimentStore:
@@ -286,6 +403,8 @@ class ExperimentStore:
             "multi-run": "inner_loop",
             "multi_run": "inner_loop",
             "surface_scoping": "outer_loop_surfaces",
+            "parallel experiments": "parallel_experiments",
+            "parallel": "parallel",
         }
 
         def _flush_list() -> None:
@@ -355,13 +474,21 @@ class ExperimentStore:
         eval_spec = list(es_raw) if isinstance(es_raw, list) else []
         hygiene_tier_weights = _parse_tier_weights(parsed.get("hygiene_weights", []))
         growth_tier_weights = _parse_tier_weights(parsed.get("growth_weights", []))
+        adversarial = _parse_adversarial(parsed.get("adversarial", []))
+        parallel = _parse_parallel(parsed.get("parallel_experiments", parsed.get("parallel", [])))
 
         clean_pr_raw = parsed.get("clean_pr", "")
-        clean_pr = str(clean_pr_raw).strip().lower() in ("true", "yes", "1") if clean_pr_raw else False
+        clean_pr = (
+            str(clean_pr_raw).strip().lower() in ("true", "yes", "1") if clean_pr_raw else False
+        )
         clean_pr_include_raw = parsed.get("clean_pr_include", [])
-        clean_pr_include = list(clean_pr_include_raw) if isinstance(clean_pr_include_raw, list) else []
+        clean_pr_include = (
+            list(clean_pr_include_raw) if isinstance(clean_pr_include_raw, list) else []
+        )
         clean_pr_exclude_raw = parsed.get("clean_pr_exclude", [])
-        clean_pr_exclude = list(clean_pr_exclude_raw) if isinstance(clean_pr_exclude_raw, list) else []
+        clean_pr_exclude = (
+            list(clean_pr_exclude_raw) if isinstance(clean_pr_exclude_raw, list) else []
+        )
 
         test_timeout_raw = parsed.get("test_timeout", "")
         try:
@@ -379,7 +506,9 @@ class ExperimentStore:
             eval_command=str(parsed.get("eval_command", "")),
             eval_threshold=float(parsed.get("eval_threshold", 0.0)),  # type: ignore[arg-type]
             constraints=list(parsed.get("constraints", [])),  # type: ignore[arg-type]
-            hypothesis_budget=HypothesisBudget(**budget_kwargs) if budget_kwargs else HypothesisBudget(),  # type: ignore[arg-type]
+            hypothesis_budget=HypothesisBudget(**budget_kwargs)  # type: ignore[arg-type]
+            if budget_kwargs
+            else HypothesisBudget(),
             target_branch=str(parsed.get("target_branch", "main")),
             smoke_test=smoke_test,
             project_eval=project_eval_dims,
@@ -395,6 +524,8 @@ class ExperimentStore:
             eval_spec=eval_spec,
             hygiene_weights=hygiene_tier_weights,
             growth_weights=growth_tier_weights,
+            adversarial=adversarial,
+            parallel=parallel,
             clean_pr=clean_pr,
             clean_pr_include=clean_pr_include,
             clean_pr_exclude=clean_pr_exclude,
@@ -413,11 +544,7 @@ class ExperimentStore:
         if not experiments_dir.exists():
             log.debug("next_id_no_experiments_dir")
             return 1
-        ids = [
-            int(d.name)
-            for d in experiments_dir.iterdir()
-            if d.is_dir() and d.name.isdigit()
-        ]
+        ids = [int(d.name) for d in experiments_dir.iterdir() if d.is_dir() and d.name.isdigit()]
         next_val = max(ids) + 1 if ids else 1
         log.debug("next_id_computed", next_id=next_val, existing_count=len(ids))
         return next_val
@@ -441,38 +568,12 @@ class ExperimentStore:
 
         try:
             from factory.registry import register_project
+
             register_project(self.project_path)
         except Exception as exc:
             log.debug("registry_begin_failed", error=str(exc))
 
         return exp_id
-
-    async def save_eval(
-        self,
-        exp_id: int,
-        phase: Literal["before", "after"],
-        score: CompositeScore,
-    ) -> None:
-        """Write eval_before.json or eval_after.json into the experiment dir."""
-        log.debug("save_eval", exp_id=exp_id, phase=phase, score=score.total)
-        exp_dir = self.factory_dir / "experiments" / f"{exp_id:03d}"
-        filename = f"eval_{phase}.json"
-        (exp_dir / filename).write_text(
-            json.dumps(score.model_dump(), indent=2, default=str) + "\n"
-        )
-
-    async def save_diff(self, exp_id: int) -> None:
-        """Capture git diff HEAD~1 into changes.diff."""
-        log.debug("save_diff", exp_id=exp_id)
-        exp_dir = self.factory_dir / "experiments" / f"{exp_id:03d}"
-        result = subprocess.run(
-            ["git", "diff", "HEAD~1"],
-            cwd=self.project_path,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        (exp_dir / "changes.diff").write_text(result.stdout)
 
     async def finalize(self, exp_id: int, record: ExperimentRecord) -> None:
         """Write verdict.json and append row to results.tsv.
@@ -505,24 +606,27 @@ class ExperimentStore:
             tsv_path = self.factory_dir / "results.tsv"
             with open(tsv_path, "a", newline="") as f:
                 writer = csv.writer(f, dialect="excel-tab")
-                writer.writerow([
-                    record.id,
-                    record.timestamp.isoformat(),
-                    record.hypothesis,
-                    record.change_summary,
-                    record.issue_number if record.issue_number is not None else "",
-                    record.pr_number if record.pr_number is not None else "",
-                    record.score_before if record.score_before is not None else "",
-                    record.score_after if record.score_after is not None else "",
-                    delta if delta is not None else "",
-                    record.verdict,
-                    record.cost_usd if record.cost_usd is not None else "",
-                    record.notes,
-                    "|".join(record.research_citations) if record.research_citations else "",
-                ])
+                writer.writerow(
+                    [
+                        record.id,
+                        record.timestamp.isoformat(),
+                        record.hypothesis,
+                        record.change_summary,
+                        record.issue_number if record.issue_number is not None else "",
+                        record.pr_number if record.pr_number is not None else "",
+                        record.score_before if record.score_before is not None else "",
+                        record.score_after if record.score_after is not None else "",
+                        delta if delta is not None else "",
+                        record.verdict,
+                        record.cost_usd if record.cost_usd is not None else "",
+                        record.notes,
+                        "|".join(record.research_citations) if record.research_citations else "",
+                    ]
+                )
 
         try:
             from factory.registry import update_project_stats
+
             update_project_stats(
                 self.project_path,
                 experiment_count=record.id,
@@ -539,10 +643,11 @@ class ExperimentStore:
             return []
 
         records: list[ExperimentRecord] = []
-        valid_verdicts = {"keep", "revert", "error"}
+        valid_verdicts = {"keep", "revert", "error", "superseded"}
         with open(tsv_path, newline="") as f:
             reader = csv.DictReader(f, dialect="excel-tab")
             for row in reader:
+
                 def _safe_int(val: str) -> int | None:
                     if not val or val in ("-", "n/a"):
                         return None
@@ -571,21 +676,23 @@ class ExperimentStore:
                     else []
                 )
 
-                records.append(ExperimentRecord(
-                    id=int(row["id"]),
-                    timestamp=datetime.fromisoformat(row["timestamp"]),
-                    hypothesis=row["hypothesis"],
-                    change_summary=row["change_summary"],
-                    issue_number=_safe_int(row["issue_number"]),
-                    pr_number=_safe_int(row["pr_number"]),
-                    score_before=_safe_float(row["score_before"]),
-                    score_after=_safe_float(row["score_after"]),
-                    delta=_safe_float(row["delta"]),
-                    verdict=verdict_raw,  # type: ignore[arg-type]
-                    cost_usd=_safe_float(row["cost_usd"]),
-                    notes=row["notes"],
-                    research_citations=citations,
-                ))
+                records.append(
+                    ExperimentRecord(
+                        id=int(row["id"]),
+                        timestamp=datetime.fromisoformat(row["timestamp"]),
+                        hypothesis=row["hypothesis"],
+                        change_summary=row["change_summary"],
+                        issue_number=_safe_int(row["issue_number"]),
+                        pr_number=_safe_int(row["pr_number"]),
+                        score_before=_safe_float(row["score_before"]),
+                        score_after=_safe_float(row["score_after"]),
+                        delta=_safe_float(row["delta"]),
+                        verdict=verdict_raw,  # type: ignore[arg-type]
+                        cost_usd=_safe_float(row["cost_usd"]),
+                        notes=row["notes"],
+                        research_citations=citations,
+                    )
+                )
         log.debug("load_history_complete", record_count=len(records))
         return records
 
@@ -605,7 +712,9 @@ class ExperimentStore:
                 "Run 'factory init --reparse' to regenerate it from factory.md."
             ) from exc
         try:
-            return FactoryConfig.model_validate(data, strict=False)  # strict=False needed to coerce enum strings from JSON (e.g. AggregateMethod)
+            return FactoryConfig.model_validate(
+                data, strict=False
+            )  # strict=False needed to coerce enum strings from JSON (e.g. AggregateMethod)
         except (ValidationError, TypeError, KeyError) as exc:
             raise ValueError(
                 f"{config_path} failed validation: {exc}. "
@@ -641,10 +750,3 @@ class ExperimentStore:
             return None
         log.debug("read_strategy_loaded", path=str(strategy_path))
         return strategy_path.read_text()
-
-    async def write_strategy(self, content: str) -> None:
-        """Write strategy/current.md."""
-        log.info("write_strategy", content_length=len(content))
-        strategy_path = self.factory_dir / "strategy" / "current.md"
-        strategy_path.parent.mkdir(parents=True, exist_ok=True)
-        strategy_path.write_text(content)

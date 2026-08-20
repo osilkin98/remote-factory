@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -170,7 +170,6 @@ class TierWeights(BaseModel):
     lint: float | None = None
     type_check: float | None = None
     coverage: float | None = None
-    guard_patterns: float | None = None
     config_parser: float | None = None
     capability_surface: float | None = None
     experiment_diversity: float | None = None
@@ -178,6 +177,67 @@ class TierWeights(BaseModel):
     research_grounding: float | None = None
     factory_effectiveness: float | None = None
     spec_compliance: float | None = None
+
+
+class ParallelConfig(BaseModel):
+    """Parallel experiment execution configuration from factory.md."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    parallel_hypotheses: int = Field(default=1, ge=1, le=8)
+    selection_strategy: Literal["best_score"] = "best_score"
+
+
+class AdversarialComponent(BaseModel):
+    """One side of an adversarial eval loop (generator or discriminator)."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    role: Literal["generator", "discriminator"]
+    eval_command: str
+    metric_name: str
+    threshold: float
+    scope: list[str] = []
+    timeout: float = 300.0
+
+
+class AdversarialConfig(BaseModel):
+    """GAN-style adversarial eval loop configuration from factory.md."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    generator: AdversarialComponent
+    discriminator: AdversarialComponent
+    hysteresis: int = 3
+    max_rounds: int | None = None
+    convergence_window: int = 5
+
+
+class AdversarialPhaseRecord(BaseModel):
+    """One entry in the adversarial phase history."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    round: int
+    active_role: Literal["generator", "discriminator"]
+    score: float
+    metric_name: str
+    timestamp: str
+    switched: bool
+
+
+class AdversarialState(BaseModel):
+    """Persisted adversarial loop state at .factory/adversarial_state.json."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    active_role: Literal["generator", "discriminator"] = "generator"
+    current_round: int = 0
+    consecutive_above: int = 0
+    generator_consecutive_above: int = 0
+    discriminator_consecutive_above: int = 0
+    converged: bool = False
+    history: list[AdversarialPhaseRecord] = []
 
 
 class FactoryConfig(BaseModel):
@@ -207,6 +267,8 @@ class FactoryConfig(BaseModel):
     eval_spec: list[str] = []
     hygiene_weights: TierWeights | None = None
     growth_weights: TierWeights | None = None
+    adversarial: AdversarialConfig | None = None
+    parallel: ParallelConfig | None = None
     clean_pr: bool = False
     clean_pr_include: list[str] = []
     clean_pr_exclude: list[str] = []
@@ -291,6 +353,7 @@ class ProjectProfile(BaseModel):
     has_linter: bool
     has_type_checker: bool
     has_ci: bool
+    has_spec: bool = False
     test_command: str | None = None
     lint_command: str | None = None
     type_check_command: str | None = None
@@ -299,17 +362,6 @@ class ProjectProfile(BaseModel):
 
 
 # ── experiments ───────────────────────────────────────────────────
-
-
-class Hypothesis(BaseModel):
-    """A proposed change generated during the observe/hypothesize phase."""
-
-    model_config = ConfigDict(strict=True, extra="forbid")
-
-    description: str
-    rationale: str
-    expected_impact: str
-    target_files: list[str]
 
 
 class ExperimentRecord(BaseModel):
@@ -326,7 +378,7 @@ class ExperimentRecord(BaseModel):
     score_before: float | None
     score_after: float | None
     delta: float | None
-    verdict: Literal["keep", "revert", "error"]
+    verdict: Literal["keep", "revert", "error", "superseded"]
     cost_usd: float | None
     notes: str
     research_citations: list[str] = []
@@ -341,7 +393,7 @@ class HypothesisOutcome(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     hypothesis: str
-    verdict: Literal["keep", "revert", "error"]
+    verdict: Literal["keep", "revert", "error", "superseded"]
     category: str
     project: str
     delta: float | None = None
@@ -404,21 +456,6 @@ class AgentUsage(BaseModel):
     model: str = ""
 
 
-# ── cost tracking ─────────────────────────────────────────────────
-
-
-class CostBudget(BaseModel):
-    """Cost guardrails for factory sessions."""
-
-    model_config = ConfigDict(strict=True, extra="forbid")
-
-    per_experiment_max: float = 2.0
-    per_session_max: float = 10.0
-    per_month_max: float = 100.0
-    current_session_spent: float = 0.0
-    current_month_spent: float = 0.0
-
-
 # ── session summary ──────────────────────────────────────────
 
 
@@ -454,10 +491,11 @@ class CycleState(BaseModel):
 
     cycle_id: str
     started_at: datetime
-    mode: Literal["build", "discover", "improve", "meta", "research", "review"]
+    mode: str
     initial_prompt: str = ""
     respawns: int = 0
     runner_name: str | None = None
+    claude_session_id: str | None = None
 
 
 # ── ACE pipeline data ────────────────────────────────────────────
@@ -527,21 +565,6 @@ class ProjectRegistry(BaseModel):
     updated_at: datetime
 
 
-# ── protocols ─────────────────────────────────────────────────────
-
-
-@runtime_checkable
-class Notifier(Protocol):
-    """Interface for sending experiment digests."""
-
-    async def send_digest(
-        self,
-        project_name: str,
-        records: list[ExperimentRecord],
-        composite: CompositeScore | None,
-    ) -> None: ...
-
-
 # ── refinement state ─────────────────────────────────────────────
 
 
@@ -574,6 +597,7 @@ class AgentRunRequest(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     prompt: str
+    prompt_core: str = ""
     task: str
     cwd: Path
     timeout: float = 600.0
@@ -581,6 +605,8 @@ class AgentRunRequest(BaseModel):
     skip_permissions: bool = True
     role: str = "unknown"
     session_name: str | None = None
+    session_id: str | None = None
+    resume_session_id: str | None = None
     project_path: Path | None = None
     extras: dict[str, object] = {}
 

@@ -1,5 +1,7 @@
 """Shared pytest fixtures for remote-factory tests."""
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -8,13 +10,23 @@ import pytest
 
 from factory.models import FactoryConfig
 
-# CRITICAL: Set FACTORY_BOB_DRY_RUN=1 before any tests run.
-# This ensures BobRunner never invokes real bob during tests.
-os.environ["FACTORY_BOB_DRY_RUN"] = "1"
-
 # Disable CEO completion guard by default in tests.
 # Tests that need to exercise the guard can unset this or test with mocked invoke_agent.
 os.environ["FACTORY_CEO_RESPAWN_DISABLED"] = "1"
+
+
+@pytest.fixture(autouse=True)
+def _no_raw_terminal():
+    """Never let a prompt take over the terminal during a test.
+
+    `factory.contained.style.read_key`/`read_line` put stdin into cbreak mode whenever it *is* a
+    terminal — and a test run launched from a shell has one. A prompt would then block forever on a
+    keypress that is never coming, ignoring any `builtins.input` patch, because the raw path does
+    not go through `input()` at all. Forcing the documented fallback makes every prompt
+    line-buffered, which is the path the tests patch.
+    """
+    with patch("factory.contained.style._raw_session", return_value=None):
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -28,11 +40,11 @@ def _isolate_registry(tmp_path: Path) -> None:
 @pytest.fixture(autouse=True)
 def _reset_agent_failure_counter() -> None:
     """Reset consecutive agent failure counter between tests."""
-    from factory.agents.runner import reset_failure_counter
-    reset_failure_counter()
-    yield  # type: ignore[misc]
-    reset_failure_counter()
+    import factory.agents.runner as runner_module
 
+    runner_module._consecutive_failures = 0
+    yield  # type: ignore[misc]
+    runner_module._consecutive_failures = 0
 
 
 @pytest.fixture(autouse=True)
@@ -45,7 +57,9 @@ def _mock_worktree(tmp_path: Path, request: pytest.FixtureRequest) -> None:
         yield  # type: ignore[misc]
         return
 
-    def _fake_create(project_path: Path, base_branch: str = "main") -> tuple[Path, str]:
+    def _fake_create(
+        project_path: Path, base_branch: str = "main", run_id: str | None = None
+    ) -> tuple[Path, str]:
         return project_path, "factory/run-fake0000"
 
     def _fake_remove(project_path: Path, worktree_path: Path, branch: str) -> None:
@@ -54,9 +68,11 @@ def _mock_worktree(tmp_path: Path, request: pytest.FixtureRequest) -> None:
     def _fake_prune(project_path: Path) -> list[str]:
         return []
 
-    with patch("factory.worktree.create_worktree", side_effect=_fake_create), \
-         patch("factory.worktree.remove_worktree", side_effect=_fake_remove), \
-         patch("factory.worktree.prune_stale", side_effect=_fake_prune):
+    with (
+        patch("factory.worktree.create_worktree", side_effect=_fake_create),
+        patch("factory.worktree.remove_worktree", side_effect=_fake_remove),
+        patch("factory.worktree.prune_stale", side_effect=_fake_prune),
+    ):
         yield  # type: ignore[misc]
 
 
@@ -64,15 +80,23 @@ def _mock_worktree(tmp_path: Path, request: pytest.FixtureRequest) -> None:
 def tmp_project(tmp_path: Path) -> Path:
     """Create a minimal project directory with git init."""
     import subprocess
+
     project = tmp_path / "test-project"
     project.mkdir()
     subprocess.run(["git", "init"], cwd=project, capture_output=True, check=True)
     subprocess.run(
         ["git", "commit", "--allow-empty", "-m", "initial"],
-        cwd=project, capture_output=True, check=True,
-        env={"GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@test.com",
-             "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@test.com",
-             "HOME": str(tmp_path), "PATH": "/usr/bin:/bin:/usr/local/bin"},
+        cwd=project,
+        capture_output=True,
+        check=True,
+        env={
+            "GIT_AUTHOR_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@test.com",
+            "GIT_COMMITTER_NAME": "test",
+            "GIT_COMMITTER_EMAIL": "test@test.com",
+            "HOME": str(tmp_path),
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+        },
     )
     return project
 
@@ -100,7 +124,7 @@ def python_project(tmp_path: Path) -> Path:
         '[project]\nname = "my-project"\nversion = "0.1.0"\n'
         'requires-python = ">=3.11"\n'
         'dependencies = ["pydantic>=2.0"]\n\n'
-        "[tool.pytest.ini_options]\nasyncio_mode = \"auto\"\n\n"
+        '[tool.pytest.ini_options]\nasyncio_mode = "auto"\n\n'
         "[tool.ruff]\nline-length = 100\n\n"
         '[dependency-groups]\ndev = ["pytest>=8.0", "ruff>=0.8"]\n'
     )

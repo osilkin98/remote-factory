@@ -89,8 +89,14 @@ def generate_agent_content(role: str) -> str:
     )
 
 
-_READ_ONLY_ROLES = frozenset({"researcher", "qa", "failure_analyst", "refiner", "profiler"})
-_WORKSPACE_WRITE_ROLES = frozenset({"builder", "archivist", "ceo", "strategist"})
+_READ_ONLY_ROLES = frozenset({
+    "researcher", "failure_analyst", "refiner", "profiler",
+    "health_checker", "code_reviewer",
+})
+_WORKSPACE_WRITE_ROLES = frozenset({
+    "builder", "archivist", "ceo", "strategist", "refactory",
+    "adversarial_tester",
+})
 
 
 def _sandbox_mode(role: str) -> str:
@@ -99,9 +105,7 @@ def _sandbox_mode(role: str) -> str:
         return "read-only"
     if role in _WORKSPACE_WRITE_ROLES:
         return "workspace-write"
-    raise ValueError(
-        f"Unknown role {role!r}: not in _READ_ONLY_ROLES or _WORKSPACE_WRITE_ROLES"
-    )
+    return "read-only"
 
 
 def _escape_toml_multiline_literal(text: str) -> str:

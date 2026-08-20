@@ -2,21 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Literal
 
 from factory.ace.injector import inject_playbook, load_playbook
 from factory.runners import get_runner
 
 logger = logging.getLogger(__name__)
 
-AgentRole = Literal[
-    "researcher", "strategist", "builder", "qa",
-    "archivist", "ceo", "failure_analyst", "refiner", "profiler",
-]
+AgentRole = str
 
 # Consecutive failure tracking
 _consecutive_failures: int = 0
@@ -41,11 +36,6 @@ class ConsecutiveAgentFailureError(Exception):
         )
 
 
-def reset_failure_counter() -> None:
-    """Reset the consecutive failure counter. Call at start of a cycle."""
-    global _consecutive_failures
-    _consecutive_failures = 0
-
 IDENTITY_REANCHOR = """\
 
 ---
@@ -58,6 +48,7 @@ IDENTITY_REANCHOR = """\
 
 # Directory containing base agent prompts (shipped with the factory)
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
+_USER_PROMPTS_DIR = Path.home() / ".factory" / "agents" / "prompts"
 
 
 def resolve_prompt(
@@ -65,15 +56,21 @@ def resolve_prompt(
     project_path: Path | None = None,
     *,
     use_profile: bool = False,
+    workflow_mode: str | None = None,
 ) -> str:
     """Resolve the prompt for an agent role.
 
     Resolution order:
     1. Project-specific override: <project>/.factory/agents/<role>.md
-    2. Factory default: factory/agents/prompts/<role>.md
+    2. User-global: ~/.factory/agents/prompts/<role>.md
+    3. Factory default: factory/agents/prompts/<role>.md
 
     When *use_profile* is True, loads ~/.factory/profile.md and appends it
     after the ACE playbook injection.
+
+    When *workflow_mode* is set and *role* is ``"ceo"``, the corresponding
+    ``skills/workflow-{workflow_mode}/SKILL.md`` is appended to the prompt
+    so it survives context compaction.
 
     Returns the prompt content as a string.
     """
@@ -90,15 +87,34 @@ def resolve_prompt(
                 logger.info("Injected playbook for %s (project override)", role)
             if use_profile:
                 prompt = _maybe_inject_profile(prompt, role)
+            if role == "ceo" and workflow_mode and project_path is not None:
+                prompt = _maybe_inject_skill(prompt, project_path, workflow_mode)
             return prompt
+
+    # Check user-global prompts (~/.factory/agents/prompts/)
+    user_path = _USER_PROMPTS_DIR / f"{role}.md"
+    if user_path.exists():
+        logger.info("Using user-global prompt for %s: %s", role, user_path)
+        prompt = user_path.read_text()
+        playbook = load_playbook(role)
+        if playbook:
+            prompt = inject_playbook(prompt, playbook)
+            logger.info("Injected playbook for %s (user-global)", role)
+        if use_profile:
+            prompt = _maybe_inject_profile(prompt, role)
+        if role == "ceo" and workflow_mode and project_path is not None:
+            prompt = _maybe_inject_skill(prompt, project_path, workflow_mode)
+        return prompt
 
     # Fall back to factory default
     default_path = _PROMPTS_DIR / f"{role}.md"
     if not default_path.exists():
-        override_hint = f" or {project_path / '.factory' / 'agents' / f'{role}.md'}" if project_path else ""
+        override_hint = (
+            f" or {project_path / '.factory' / 'agents' / f'{role}.md'}" if project_path else ""
+        )
         raise FileNotFoundError(
             f"No prompt found for agent role '{role}'. "
-            f"Expected at {default_path}{override_hint}"
+            f"Expected at {default_path}, {_USER_PROMPTS_DIR / f'{role}.md'}{override_hint}"
         )
 
     prompt = default_path.read_text()
@@ -112,7 +128,89 @@ def resolve_prompt(
     if use_profile:
         prompt = _maybe_inject_profile(prompt, role)
 
+    if role == "ceo" and workflow_mode and project_path is not None:
+        prompt = _maybe_inject_skill(prompt, project_path, workflow_mode)
+
     return prompt
+
+
+_PROMPT_CORE_TEMPLATE = """\
+# Factory CEO Agent — Resume Identity
+
+You ARE the Factory CEO — the executive orchestrator of the Software Factory. \
+You delegate ALL technical work to specialist agents and review their output. \
+You own the experiment lifecycle: `factory begin`, dispatch agents, `factory finalize`.
+
+## Agent Dispatch
+
+```bash
+factory agent <role> --task "<description>" --project /path [--timeout 600]
+```
+
+Roles: researcher, strategist, builder, health_checker, code_reviewer, adversarial_tester, archivist.
+
+## Permitted Actions
+
+- `factory agent <role>` — spawn specialist agents
+- `factory <cmd>` — CLI commands (`factory --help`)
+- `git log/diff/status/add/commit/checkout/branch` — version control
+- `gh issue/pr` — GitHub operations
+- `cat/ls/head/grep` — read files for review
+- Write verdict files to `.factory/reviews/`
+
+## Forbidden Actions (Sacred Rule 8)
+
+- Writing or editing source code files
+- Running `python eval/score.py`, `pytest`, `ruff`, `mypy` directly
+- Using Claude Code's native `Agent` tool
+- Editing `CLAUDE.md`, `factory.md`, or project config files
+
+## Sacred Rules
+
+1. Do not delete or overwrite existing tests
+2. Do not modify files outside the declared scope
+3. Do not introduce secrets or credentials
+4. Do not lower the eval threshold
+5. Do not skip the eval step
+6. Do not merge PRs
+7. Do not skip archival
+8. Do not do another agent's job — delegate, review, decide
+9. Do not skip QA verification
+
+## CEO Review Gate
+
+After EVERY agent, review output at `.factory/reviews/<role>-latest.md`. \
+Write verdict to `.factory/reviews/ceo-verdict-<role>.md`:
+- **PROCEED** — satisfactory, continue
+- **REDIRECT** — re-invoke with corrections (max 2)
+- **ABORT** — log failure, finalize as error
+
+## Keep/Revert Essentials
+
+All must be true to keep: tests pass, lint clean, score improved, no guard violations, \
+code readable. Use `factory finalize` with `--verdict keep` or `--verdict revert`.
+
+## Error Recovery
+
+On agent failure: re-invoke with adjusted params → try different agent → finalize as error. \
+NEVER do the agent's work yourself.
+
+## Mode Pointer
+
+Full workflow playbook is injected via system prompt. On resume, read \
+`.factory/strategy/current.md` for your plan and session state.
+"""
+
+
+def resolve_prompt_core() -> str:
+    """Return a slim (~7-8KB) CEO identity prompt for CLAUDE.md resume resilience.
+
+    This contains only the essential CEO identity, Sacred Rules, permitted/forbidden
+    actions, agent dispatch syntax, keep/revert essentials, error recovery summary,
+    and a pointer to the full playbook. The full prompt is delivered separately via
+    --append-system-prompt-file.
+    """
+    return _PROMPT_CORE_TEMPLATE
 
 
 def _maybe_inject_profile(prompt: str, role: str) -> str:
@@ -126,6 +224,19 @@ def _maybe_inject_profile(prompt: str, role: str) -> str:
     return prompt
 
 
+def _maybe_inject_skill(prompt: str, project_path: Path, workflow_mode: str) -> str:
+    """Append the workflow SKILL.md to the CEO prompt so it survives compaction."""
+    skill_path = project_path / "skills" / f"workflow-{workflow_mode}" / "SKILL.md"
+    if not skill_path.exists():
+        raise FileNotFoundError(
+            f"SKILL.md not found for mode {workflow_mode} at {skill_path}. "
+            f"Run 'factory workflow export-skills' or check ensure_skills() was called."
+        )
+    skill_content = skill_path.read_text()
+    logger.info("Injected SKILL.md for workflow-%s into CEO prompt", workflow_mode)
+    return prompt + f"\n\n# Workflow Playbook ({workflow_mode})\n\n{skill_content}"
+
+
 async def invoke_agent(
     role: AgentRole,
     task: str,
@@ -137,10 +248,15 @@ async def invoke_agent(
     runner_name: str | None = None,
     _track_failures: bool = True,
     session_name: str | None = None,
+    session_id: str | None = None,
+    resume_session_id: str | None = None,
     use_profile: bool = False,
     tmux_persist: bool = False,
     background: bool = False,
     review_tag: str | None = None,
+    workflow_mode: str | None = None,
+    settings_file: str | None = None,
+    prompt_override: str | None = None,
 ) -> tuple[str, int]:
     """Invoke a Claude Code agent with the resolved prompt + task.
 
@@ -152,7 +268,22 @@ async def invoke_agent(
     """
     global _consecutive_failures
 
-    prompt = resolve_prompt(role, project_path, use_profile=use_profile)
+    if prompt_override:
+        prompt = prompt_override
+    else:
+        prompt = resolve_prompt(
+            role, project_path, use_profile=use_profile, workflow_mode=workflow_mode
+        )
+
+    if os.environ.get("FACTORY_NO_GITHUB") == "1":
+        prompt += (
+            "\n\n## GitHub Disabled\n\n"
+            "GitHub integration is disabled for this session (--no-github). "
+            "Do NOT run any gh CLI commands (gh issue, gh pr, gh api, etc.). "
+            "Do NOT create pull requests or reference GitHub issues. "
+            "Work locally only — create commits, run tests, but skip all GitHub operations. "
+            "When a step would normally involve GitHub, skip it and note that it was skipped.\n"
+        )
 
     logger.info("Invoking %s agent for %s", role, project_path.name)
 
@@ -178,8 +309,14 @@ async def invoke_agent(
         skip_permissions=dangerously_skip_permissions,
         role=role,
         session_name=agent_session_name,
+        session_id=session_id,
+        resume_session_id=resume_session_id,
         project_path=project_path,
-        extras={"tmux_persist": tmux_persist, "background": background},
+        extras={
+            "tmux_persist": tmux_persist,
+            "background": background,
+            **({"settings_file": settings_file} if settings_file else {}),
+        },
     )
 
     old_parent_span = os.environ.get("FACTORY_PARENT_SPAN_ID")
@@ -203,12 +340,18 @@ async def invoke_agent(
         if return_code != 0:
             logger.warning("%s agent exited with code %d", role, return_code)
             _emit_safe(
-                project_path, "agent.failed", agent=role,
+                project_path,
+                "agent.failed",
+                agent=role,
                 data={"return_code": return_code, "stderr": stdout[:200] if stdout else ""},
             )
             _complete_span_safe(
-                project_path, sid, status="failed",
-                usage=usage, metadata=result.metadata, output=stdout,
+                project_path,
+                sid,
+                status="failed",
+                usage=usage,
+                metadata=result.metadata,
+                output=stdout,
             )
             if _track_failures:
                 _consecutive_failures += 1
@@ -218,25 +361,33 @@ async def invoke_agent(
             if review_tag:
                 completed_data["review_tag"] = review_tag
             if usage is not None:
-                completed_data.update({
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "cache_read_tokens": usage.cache_read_tokens,
-                    "total_cost_usd": usage.total_cost_usd,
-                    "duration_ms": usage.duration_ms,
-                    "num_turns": usage.num_turns,
-                    "model": usage.model,
-                })
+                completed_data.update(
+                    {
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "cache_read_tokens": usage.cache_read_tokens,
+                        "total_cost_usd": usage.total_cost_usd,
+                        "duration_ms": usage.duration_ms,
+                        "num_turns": usage.num_turns,
+                        "model": usage.model,
+                    }
+                )
             for meta_key in ("session_id", "stop_reason", "terminal_reason"):
                 if result.metadata.get(meta_key) is not None:
                     completed_data[meta_key] = result.metadata[meta_key]
             _emit_safe(
-                project_path, "agent.completed", agent=role,
+                project_path,
+                "agent.completed",
+                agent=role,
                 data=completed_data,
             )
             _complete_span_safe(
-                project_path, sid, status="completed",
-                usage=usage, metadata=result.metadata, output=stdout,
+                project_path,
+                sid,
+                status="completed",
+                usage=usage,
+                metadata=result.metadata,
+                output=stdout,
             )
             if _track_failures:
                 _consecutive_failures = 0
@@ -296,7 +447,8 @@ def _begin_span_safe(
         parent_span_id = os.environ.get("FACTORY_PARENT_SPAN_ID")
         logger.debug(
             "Langfuse env: FACTORY_TRACE_ID=%s FACTORY_PARENT_SPAN_ID=%s",
-            trace_id, parent_span_id,
+            trace_id,
+            parent_span_id,
         )
         if not trace_id:
             result = begin_trace(project_path.name, cycle_id=f"standalone-{role}")
@@ -336,8 +488,15 @@ def _complete_span_safe(
         usage_dict: dict | None = None
         if usage is not None:
             usage_dict = {}
-            for key in ("input_tokens", "output_tokens", "cache_read_tokens",
-                        "total_cost_usd", "duration_ms", "num_turns", "model"):
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "total_cost_usd",
+                "duration_ms",
+                "num_turns",
+                "model",
+            ):
                 val = getattr(usage, key, None)
                 if val is not None:
                     usage_dict[key] = val
@@ -348,18 +507,25 @@ def _complete_span_safe(
             ingest_transcript_to_span(trace_id, span_id, claude_session_id, project_path)
 
         end_span(
-            trace_id, span_id,
-            status=status, usage=usage_dict, metadata=meta or None,
+            trace_id,
+            span_id,
+            status=status,
+            usage=usage_dict,
+            metadata=meta or None,
             output=output[:4000] if output else None,
         )
         from factory.telemetry import flush as _flush
+
         _flush()
     except Exception:
         logger.debug("Failed to complete span %s", span_id, exc_info=True)
 
 
 def _save_review(
-    project_path: Path, role: str, output: str, return_code: int,
+    project_path: Path,
+    role: str,
+    output: str,
+    return_code: int,
     review_tag: str | None = None,
 ) -> None:
     """Save agent output to .factory/reviews/<role>-latest.md for CEO review.
@@ -415,6 +581,12 @@ def begin_cycle_session(
         trace_id, span_id = result
         os.environ["FACTORY_TRACE_ID"] = trace_id
         os.environ["FACTORY_PARENT_SPAN_ID"] = span_id
+        try:
+            factory_dir = project_path / ".factory"
+            factory_dir.mkdir(parents=True, exist_ok=True)
+            (factory_dir / "trace_id.txt").write_text(trace_id)
+        except OSError:
+            logger.debug("Failed to write trace_id.txt", exc_info=True)
         return span_id
     except Exception:
         logger.debug("Failed to begin cycle trace", exc_info=True)
@@ -438,82 +610,3 @@ def complete_cycle_session(
         flush()
     except Exception:
         logger.debug("Failed to complete cycle trace", exc_info=True)
-
-
-async def invoke_agents_parallel(
-    tasks: list[tuple[AgentRole, str]],
-    project_path: Path,
-    *,
-    timeout: float = 600.0,
-    dangerously_skip_permissions: bool = True,
-    model: str | None = None,
-    runner_name: str | None = None,
-    tmux_persist: bool = False,
-    background: bool = False,
-    review_tags: list[str | None] | None = None,
-) -> list[tuple[str, int]]:
-    """Invoke multiple agents concurrently. Returns list of (output, return_code).
-
-    Args:
-        review_tags: Optional list of review tags, one per task. When not
-            provided, auto-generates numeric tags (0, 1, 2, …) for any role
-            that appears more than once in *tasks* so their review files don't
-            clobber each other.
-
-    Raises:
-        ConsecutiveAgentFailureError: If all agents in the batch fail, indicating
-            infrastructure problems (e.g., API key not propagating to subprocesses).
-    """
-    # Auto-generate tags for duplicate roles when none are provided
-    if review_tags is None:
-        from collections import Counter
-
-        role_counts = Counter(role for role, _ in tasks)
-        duplicated_roles = {role for role, count in role_counts.items() if count > 1}
-        if duplicated_roles:
-            role_idx: dict[str, int] = {}
-            review_tags = []
-            for role, _ in tasks:
-                if role in duplicated_roles:
-                    idx = role_idx.get(role, 0)
-                    review_tags.append(str(idx))
-                    role_idx[role] = idx + 1
-                else:
-                    review_tags.append(None)
-        else:
-            review_tags = [None] * len(tasks)
-
-    coros = [
-        invoke_agent(
-            role,
-            task,
-            project_path,
-            timeout=timeout,
-            dangerously_skip_permissions=dangerously_skip_permissions,
-            model=model,
-            runner_name=runner_name,
-            _track_failures=False,  # Avoid race condition; track locally below
-            tmux_persist=tmux_persist,
-            background=background,
-            review_tag=tag,
-        )
-        for (role, task), tag in zip(tasks, review_tags)
-    ]
-    results = list(await asyncio.gather(*coros))
-
-    # Track failures locally to avoid race condition with global counter
-    failure_count = sum(1 for _, code in results if code != 0)
-    if failure_count >= _FAILURE_ABORT_THRESHOLD and failure_count == len(results):
-        # All agents failed — likely infrastructure issue
-        _emit_safe(
-            project_path,
-            "cycle.aborted",
-            data={
-                "reason": "consecutive_agent_failures",
-                "failure_count": failure_count,
-                "last_agent": "parallel_batch",
-            },
-        )
-        raise ConsecutiveAgentFailureError(failure_count, "parallel_batch")
-
-    return results

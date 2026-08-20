@@ -185,7 +185,7 @@ def test_cmd_finalize_emits_enriched_event(tmp_path: Path) -> None:
     mock_store = MagicMock()
 
     with patch("factory.store.ExperimentStore", return_value=mock_store), \
-         patch("factory.cli._run", return_value=None):
+         patch("factory.cli.store._run", return_value=None):
         from factory.cli import cmd_finalize
         cmd_finalize(ns)
 
@@ -200,6 +200,42 @@ def test_cmd_finalize_emits_enriched_event(tmp_path: Path) -> None:
     assert data["score_after"] == 0.75
     assert data["delta"] == 0.15
     assert data["cost_usd"] == 2.50
+
+
+def test_finalize_autodetects_pr_number(tmp_path: Path) -> None:
+    """cmd_finalize auto-detects PR number via gh when args.pr is None."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    _setup_factory_dir(project)
+
+    ns = argparse.Namespace(
+        path=str(project),
+        id=1,
+        verdict="keep",
+        hypothesis="Auto PR detection",
+        summary="Testing auto PR",
+        cost=1.00,
+        issue=42,
+        pr=None,
+        score_before=0.50,
+        score_after=0.60,
+        notes="",
+        force=True,
+    )
+
+    mock_store = MagicMock()
+    fake_gh_result = MagicMock(returncode=0, stdout=b"123\n")
+
+    with patch("factory.store.ExperimentStore", return_value=mock_store), \
+         patch("factory.cli.store._run", return_value=None), \
+         patch("subprocess.run", return_value=fake_gh_result):
+        from factory.cli import cmd_finalize
+        cmd_finalize(ns)
+
+    events = load_events(project)
+    finalize_events = [e for e in events if e["type"] == "experiment.finalize"]
+    assert len(finalize_events) == 1
+    assert finalize_events[0]["data"]["pr_number"] == 123
 
 
 def test_finalize_event_with_null_scores(tmp_path: Path) -> None:
@@ -225,7 +261,7 @@ def test_finalize_event_with_null_scores(tmp_path: Path) -> None:
     mock_store = MagicMock()
 
     with patch("factory.store.ExperimentStore", return_value=mock_store), \
-         patch("factory.cli._run", return_value=None), \
+         patch("factory.cli.store._run", return_value=None), \
          patch("factory.events.load_events", return_value=[]), \
          patch("factory.events.sum_agent_costs", return_value=0.0):
         from factory.cli import cmd_finalize
@@ -413,7 +449,7 @@ def test_finalize_auto_cost_from_events(tmp_path: Path) -> None:
     mock_store = MagicMock()
 
     with patch("factory.store.ExperimentStore", return_value=mock_store), \
-         patch("factory.cli._run", return_value=None):
+         patch("factory.cli.store._run", return_value=None):
         from factory.cli import cmd_finalize
         cmd_finalize(ns)
 
@@ -429,7 +465,7 @@ def test_finalize_auto_cost_from_events(tmp_path: Path) -> None:
 
 def test_emit_cli_event_exception_swallowed(tmp_path: Path) -> None:
     """_emit_cli_event silently swallows emit_event failures."""
-    from factory.cli import _emit_cli_event
+    from factory.cli._helpers import _emit_cli_event
 
     project = tmp_path / "proj"
     project.mkdir()
@@ -491,7 +527,7 @@ def test_finalize_precheck_overrides_verdict_emits_event(tmp_path: Path) -> None
     mock_store.load_history = MagicMock(return_value=[])
 
     with patch("factory.store.ExperimentStore", return_value=mock_store), \
-         patch("factory.cli._run", side_effect=[[], None]), \
+         patch("factory.cli.store._run", side_effect=[[], None]), \
          patch("factory.precheck.run_precheck", return_value=failed_result):
         from factory.cli import cmd_finalize
         cmd_finalize(ns)
@@ -519,6 +555,7 @@ def test_create_worktree_cleans_existing_factory_dir(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
     _setup_factory_dir(project)
+    (project / ".factory" / "config.json").write_text("{}")
 
     def fake_subprocess_run(cmd, **kwargs):
         if cmd[0] == "git" and "worktree" in cmd and "add" in cmd:
@@ -533,8 +570,10 @@ def test_create_worktree_cleans_existing_factory_dir(tmp_path: Path) -> None:
         wt_path, branch = create_worktree(project, "main")
 
     wt_factory = wt_path / ".factory"
-    assert wt_factory.is_symlink()
-    assert wt_factory.resolve() == (project / ".factory").resolve()
+    assert wt_factory.is_dir() and not wt_factory.is_symlink()
+    assert (wt_factory / "config.json").is_symlink()
+    assert (wt_factory / "strategy").is_dir()
+    assert not (wt_factory / "dummy.txt").exists()
 
 
 @pytest.mark.real_worktree
@@ -543,6 +582,7 @@ def test_create_worktree_cleans_existing_factory_symlink(tmp_path: Path) -> None
     project = tmp_path / "proj"
     project.mkdir()
     _setup_factory_dir(project)
+    (project / ".factory" / "config.json").write_text("{}")
 
     def fake_subprocess_run(cmd, **kwargs):
         if cmd[0] == "git" and "worktree" in cmd and "add" in cmd:
@@ -558,8 +598,9 @@ def test_create_worktree_cleans_existing_factory_symlink(tmp_path: Path) -> None
         wt_path, branch = create_worktree(project, "main")
 
     wt_factory = wt_path / ".factory"
-    assert wt_factory.is_symlink()
-    assert wt_factory.resolve() == (project / ".factory").resolve()
+    assert wt_factory.is_dir() and not wt_factory.is_symlink()
+    assert (wt_factory / "config.json").is_symlink()
+    assert (wt_factory / "strategy").is_dir()
 
 
 @pytest.mark.real_worktree

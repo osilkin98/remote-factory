@@ -5,13 +5,16 @@ the factory itself (not by per-project eval/score.py) and auto-detect the
 project's tooling. Projects can ADD dimensions via eval/score.py but cannot
 remove any of these.
 
-Together with the 5 growth dimensions in growth.py, these form the 11
+Together with the 6 growth dimensions in growth.py, these form the 12
 mandatory eval dimensions that define the factory's quality baseline.
 
 All functions take a project_path and return an EvalResult-compatible dict.
 If a tool is not detected for a dimension, score is 0.5 (neutral), not 0.
 """
 
+import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import structlog
@@ -24,12 +27,12 @@ log = structlog.get_logger()
 # Relative weights within the hygiene category (sum to 1.0).
 # The runner normalizes these so that hygiene gets 50% of the composite.
 HYGIENE_WEIGHTS = {
-    "tests": 0.30,
+    "tests": 0.31,
     "lint": 0.15,
     "type_check": 0.10,
     "coverage": 0.25,
-    "guard_patterns": 0.10,
     "config_parser": 0.10,
+    "architecture": 0.09,
 }
 
 
@@ -127,91 +130,7 @@ def eval_type_check(project_path: Path) -> dict:
 # ── Dimension 4: coverage (weight 0.25) ───────────────────────────
 
 
-def eval_coverage(project_path: Path) -> dict:
-    """Run test coverage across detected sub-projects."""
-    sub_projects = _find_sub_projects(project_path)
-    fragments = []
-    for sp in sub_projects:
-        for evaluator in detect_languages(sp):
-            result = evaluator.run_coverage(sp)
-            if result is not None:
-                fragments.append(result)
-    if not fragments:
-        return _neutral("coverage", "no coverage tool detected")
-    return _aggregate(fragments, "coverage")
-
-
-# ── Dimension 5: guard_patterns (weight 0.10) ─────────────────────
-
-
-def eval_guard_patterns(project_path: Path) -> dict:
-    """Test that the factory's guard glob matching works correctly on this project."""
-    try:
-        from factory.eval.guards import _glob_match
-    except (ImportError, AttributeError) as exc:
-        return {
-            "name": "guard_patterns",
-            "score": 0.0,
-            "weight": HYGIENE_WEIGHTS["guard_patterns"],
-            "passed": False,
-            "details": f"Could not import _glob_match: {exc}",
-        }
-
-    # Read project scope from config if available
-    scope_patterns: list[str] = []
-    config_path = project_path / ".factory" / "config.json"
-    if config_path.exists():
-        import json
-        try:
-            data = json.loads(config_path.read_text())
-            scope_patterns = data.get("scope", [])
-        except (json.JSONDecodeError, KeyError):
-            pass
-
-    # Build test cases from the project's actual scope + universal cases
-    test_cases: list[tuple[str, str, bool]] = [
-        # Universal: .factory/ should never match user scope
-        ("src/**/*.py", ".factory/config.json", False),
-        ("src/**/*.py", "src/main.py", True),
-        ("tests/**/*.py", "tests/test_main.py", True),
-        ("tests/**/*.py", "src/main.py", False),
-    ]
-
-    # Add project-specific scope tests
-    for pattern in scope_patterns[:4]:
-        # The pattern itself should match something reasonable
-        if "**" in pattern:
-            parts = pattern.split("**")
-            prefix = parts[0].rstrip("/")
-            if prefix:
-                test_cases.append((pattern, f"{prefix}/example.py", True))
-                test_cases.append((pattern, "unrelated/file.txt", False))
-
-    correct = 0
-    details: list[str] = []
-    for pattern, filepath, expected in test_cases:
-        actual = _glob_match(filepath, pattern)
-        if actual == expected:
-            correct += 1
-        else:
-            details.append(f"FAIL: {pattern} vs {filepath} expected={expected} got={actual}")
-
-    total = len(test_cases)
-    score = correct / total if total > 0 else 1.0
-    summary = f"{correct}/{total} pattern tests passed"
-    if details:
-        summary += "; " + "; ".join(details[:3])
-
-    return {
-        "name": "guard_patterns",
-        "score": round(score, 4),
-        "weight": HYGIENE_WEIGHTS["guard_patterns"],
-        "passed": correct == total,
-        "details": summary,
-    }
-
-
-# ── Dimension 6: config_parser (weight 0.10) ──────────────────────
+# ── Dimension 5: config_parser (weight 0.10) ──────────────────────
 
 
 def _parse_factory_md(path: Path) -> dict[str, str | list[str] | float]:
@@ -314,6 +233,104 @@ def eval_config_parser(project_path: Path) -> dict:
         }
 
 
+# ── Dimension 6: architecture (weight 0.09) ──────────────────────
+
+
+def eval_architecture(project_path: Path) -> dict:
+    """Run Sentrux architecture quality check (conditional on .sentrux/rules.toml)."""
+    rules_path = project_path / ".sentrux" / "rules.toml"
+    if not rules_path.exists():
+        return _neutral("architecture", "no .sentrux/rules.toml found")
+
+    if not shutil.which("sentrux"):
+        return _neutral("architecture", "sentrux not installed")
+
+    try:
+        result = subprocess.run(
+            ["sentrux", "check", "."],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "name": "architecture",
+            "score": 0.5,
+            "weight": HYGIENE_WEIGHTS["architecture"],
+            "passed": True,
+            "details": "Timeout: sentrux check exceeded 120s",
+        }
+
+    stdout = result.stdout.strip()
+
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        if result.returncode == 0:
+            return {
+                "name": "architecture",
+                "score": 1.0,
+                "weight": HYGIENE_WEIGHTS["architecture"],
+                "passed": True,
+                "details": f"All constraints satisfied (exit 0): {stdout[:200]}",
+            }
+        return {
+            "name": "architecture",
+            "score": 0.0,
+            "weight": HYGIENE_WEIGHTS["architecture"],
+            "passed": False,
+            "details": f"Rule violations (exit {result.returncode}): {stdout[:200]}",
+        }
+
+    quality_signal = data.get("quality_signal", 0)
+    score = max(0.0, min(1.0, quality_signal / 10000))
+    bottleneck = data.get("bottleneck", "unknown")
+    passed = result.returncode == 0
+
+    arch_result: dict = {
+        "name": "architecture",
+        "score": round(score, 4),
+        "weight": HYGIENE_WEIGHTS["architecture"],
+        "passed": passed,
+        "details": f"quality_signal={quality_signal}/10000, bottleneck={bottleneck}",
+    }
+
+    scan_metrics = _run_sentrux_scan(project_path)
+    if scan_metrics:
+        arch_result["scan_metrics"] = scan_metrics
+
+    return arch_result
+
+
+def _run_sentrux_scan(project_path: Path) -> dict | None:
+    """Run ``sentrux scan .`` and return the 5 individual metrics, or None on failure."""
+    try:
+        result = subprocess.run(
+            ["sentrux", "scan", "."],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+    try:
+        data = json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    metric_keys = ("modularity", "acyclicity", "depth", "equality", "redundancy")
+    metrics = {}
+    for key in metric_keys:
+        val = data.get(key)
+        if val is not None:
+            metrics[key] = round(float(val), 4)
+
+    return metrics if metrics else None
+
+
 # ── Public API ─────────────────────────────────────────────────────
 
 
@@ -330,8 +347,16 @@ def _collect_test_and_coverage(project_path: Path, timeout: int = 300) -> tuple[
             if cov_frag is not None:
                 cov_fragments.append(cov_frag)
 
-    test_result = _aggregate(test_fragments, "tests") if test_fragments else _neutral("tests", "no test suite detected")
-    cov_result = _aggregate(cov_fragments, "coverage") if cov_fragments else _neutral("coverage", "no coverage tool detected")
+    test_result = (
+        _aggregate(test_fragments, "tests")
+        if test_fragments
+        else _neutral("tests", "no test suite detected")
+    )
+    cov_result = (
+        _aggregate(cov_fragments, "coverage")
+        if cov_fragments
+        else _neutral("coverage", "no coverage tool detected")
+    )
     return test_result, cov_result
 
 
@@ -343,6 +368,6 @@ def compute_hygiene_results(project_path: Path, test_timeout: int = 600) -> list
         eval_lint(project_path),
         eval_type_check(project_path),
         cov_result,
-        eval_guard_patterns(project_path),
         eval_config_parser(project_path),
+        eval_architecture(project_path),
     ]

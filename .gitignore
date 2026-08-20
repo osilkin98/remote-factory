@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 *.egg-info/
 dist/
+!pfexec/dist/
+factory/_version.py
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -27,7 +29,13 @@ dist/
 /agents/
 /codex-agents/
 
+# Generated workflow skills (built on-the-fly by factory skill_cache)
+skills/workflow-*/SKILL.md
+skills/workflow-*/SKILL.annotations.yaml
+
 # Dev artifacts
 .playwright-mcp/
 screenshots/
 docs/factory-slides/
+graphify-out/
+graph.json

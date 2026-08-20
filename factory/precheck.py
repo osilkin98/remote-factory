@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import structlog
@@ -237,6 +238,67 @@ def check_hard_constraints(
     return results
 
 
+def check_qa_execution(
+    project_path: Path,
+    exp_id: int,
+) -> CheckResult:
+    """Verify QA verification was invoked for this experiment — Sacred Rule 9.
+
+    Matches both the old monolithic QA agent events and the new deep-QA
+    specialist events (health_checker, code_reviewer, adversarial_tester).
+    """
+    from factory.events import load_events
+
+    events = load_events(project_path)
+
+    exp_start_ts: datetime | None = None
+    for ev in reversed(events):
+        if ev.get("type") == "experiment.begin":
+            ev_data = ev.get("data", {})
+            if ev_data.get("exp_id") == exp_id:
+                ts_str = ev.get("timestamp")
+                if ts_str:
+                    exp_start_ts = datetime.fromisoformat(ts_str)
+                break
+
+    if exp_start_ts is None:
+        return CheckResult(
+            name="qa_execution",
+            passed=True,
+            detail=f"No experiment.begin event found for exp_id={exp_id} — skipping QA check",
+        )
+
+    qa_roles = {"qa", "health_checker", "code_reviewer", "adversarial_tester"}
+
+    for ev in events:
+        ts_str = ev.get("timestamp")
+        if not ts_str:
+            continue
+        ev_ts = datetime.fromisoformat(ts_str)
+        if ev_ts <= exp_start_ts:
+            continue
+
+        ev_type = ev.get("type", "")
+        if ev_type == "qa.completed":
+            return CheckResult(
+                name="qa_execution",
+                passed=True,
+                detail="QA verification completed for this experiment",
+            )
+        if ev_type == "agent.completed" and ev.get("agent") in qa_roles:
+            return CheckResult(
+                name="qa_execution",
+                passed=True,
+                detail=f"QA verification completed for this experiment ({ev.get('agent')})",
+            )
+
+    return CheckResult(
+        name="qa_execution",
+        passed=False,
+        detail="QA verification not invoked — Sacred Rule 9 violation",
+    )
+
+
 def run_precheck(
     *,
     score_before: float | None,
@@ -250,6 +312,7 @@ def run_precheck(
     similarity_threshold: float = 0.6,
     fixed_surfaces: list[str] | None = None,
     hard_constraints: list[HardConstraint] | None = None,
+    exp_id: int | None = None,
 ) -> PreCheckResult:
     """Run all prechecks and return aggregate result.
 
@@ -277,6 +340,10 @@ def run_precheck(
     # 5. Hard constraints (user-defined checks from factory.md)
     if hard_constraints:
         checks.extend(check_hard_constraints(hard_constraints, project_path))
+
+    # 6. QA execution check (only when exp_id is provided)
+    if exp_id is not None:
+        checks.append(check_qa_execution(project_path, exp_id))
 
     # Aggregate
     failures = [c.name for c in checks if not c.passed]

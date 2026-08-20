@@ -5,7 +5,34 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
-from factory.agents.runner import _save_review, resolve_prompt
+import pytest
+
+from factory.agents.runner import _save_review, resolve_prompt, resolve_prompt_core
+
+
+class TestResolvePromptCore:
+    def test_returns_string_under_40000_bytes(self) -> None:
+        core = resolve_prompt_core()
+        assert isinstance(core, str)
+        assert len(core.encode("utf-8")) < 40000
+
+    def test_contains_sacred_rules(self) -> None:
+        core = resolve_prompt_core()
+        assert "Sacred Rules" in core
+
+    def test_contains_agent_dispatch_syntax(self) -> None:
+        core = resolve_prompt_core()
+        assert "factory agent" in core
+
+    def test_contains_review_verdicts(self) -> None:
+        core = resolve_prompt_core()
+        assert "PROCEED" in core
+        assert "REDIRECT" in core
+        assert "ABORT" in core
+
+    def test_contains_mode_pointer(self) -> None:
+        core = resolve_prompt_core()
+        assert ".factory/strategy/current.md" in core
 
 
 class TestResolvePromptWithProfile:
@@ -40,6 +67,60 @@ class TestResolvePromptWithProfile:
         playbook_idx = prompt.index("Behavioral Playbook")
         profile_idx = prompt.index("User Profile")
         assert profile_idx > playbook_idx
+
+
+class TestResolvePromptWithWorkflowMode:
+    def test_ceo_with_workflow_mode_injects_skill(self, tmp_path: Path) -> None:
+        skill_dir = tmp_path / "skills" / "workflow-improve"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Improve Workflow\n\nStep 1: study")
+        prompt = resolve_prompt("ceo", tmp_path, workflow_mode="improve")
+        assert "# Workflow Playbook (improve)" in prompt
+        assert "# Improve Workflow" in prompt
+        assert "Step 1: study" in prompt
+
+    def test_ceo_without_workflow_mode_no_skill(self, tmp_path: Path) -> None:
+        prompt = resolve_prompt("ceo", tmp_path)
+        assert "# Workflow Playbook" not in prompt
+
+    def test_non_ceo_role_ignores_workflow_mode(self, tmp_path: Path) -> None:
+        skill_dir = tmp_path / "skills" / "workflow-improve"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Improve Workflow\n\nStep 1: study")
+        prompt = resolve_prompt("researcher", tmp_path, workflow_mode="improve")
+        assert "# Workflow Playbook" not in prompt
+
+    def test_missing_skill_file_raises_error(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError, match="SKILL.md not found"):
+            resolve_prompt("ceo", tmp_path, workflow_mode="nonexistent")
+
+
+class TestBuildCeoTaskNoSkillRead:
+    def test_improve_mode_no_skill_read_instruction(self, tmp_path: Path) -> None:
+        from factory.cli._task_builder import _build_ceo_task
+
+        task = _build_ceo_task(tmp_path, "improve")
+        assert "read `skills/workflow-" not in task
+        assert "playbook" in task.lower()
+
+    def test_build_mode_no_skill_read_instruction(self, tmp_path: Path) -> None:
+        from factory.cli._task_builder import _build_ceo_task
+
+        task = _build_ceo_task(tmp_path, "build")
+        assert "read `skills/workflow-" not in task
+
+    def test_create_mode_no_skill_read_instruction(self, tmp_path: Path) -> None:
+        from factory.cli._task_builder import _build_ceo_task
+
+        task = _build_ceo_task(tmp_path, "create")
+        assert "read `skills/workflow-" not in task
+        assert "skills/workflow-create/SKILL.md" not in task
+
+    def test_research_mode_no_skill_read_instruction(self, tmp_path: Path) -> None:
+        from factory.cli._task_builder import _build_ceo_task
+
+        task = _build_ceo_task(tmp_path, "research")
+        assert "read `skills/workflow-" not in task
 
 
 class TestSaveReview:

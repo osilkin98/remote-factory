@@ -22,6 +22,7 @@ class ReviewPayload:
     guard_results: dict[str, str]  # {check_name: "PASS" | "FAIL"}
     precheck_summary: str
     code_notes: list[str]
+    qa_body: str = ""
     experiment_id: int | None = None
     hypothesis: str = ""
 
@@ -90,6 +91,12 @@ def format_review(payload: ReviewPayload) -> str:
             lines.append(f"- {note}")
         lines.append("")
 
+    if payload.qa_body:
+        lines.append("### QA Analysis")
+        lines.append("")
+        lines.append(payload.qa_body)
+        lines.append("")
+
     lines.append("---")
     lines.append("*Posted by Factory CEO*")
 
@@ -151,6 +158,8 @@ def post_review(
 
     if result.returncode == 0:
         log.info("post_review_success", pr=pr_number)
+        if verdict == "KEEP":
+            mark_pr_ready(pr_number, repo=repo)
         return True
 
     log.warning(
@@ -160,7 +169,37 @@ def post_review(
     )
     if _post_comment(pr_number, review_body, repo=repo):
         log.info("post_review_comment_success", pr=pr_number)
+        if verdict == "KEEP":
+            mark_pr_ready(pr_number, repo=repo)
         return True
 
     log.error("post_review_comment_failed", pr=pr_number)
+    return False
+
+
+def mark_pr_ready(pr_number: int, repo: str | None = None) -> bool:
+    """Mark a draft PR as ready for review using gh CLI.
+
+    Idempotent — calling on an already-ready PR is a no-op (gh returns 0).
+    """
+    cmd = ["gh", "pr", "ready", str(pr_number)]
+    if repo:
+        cmd.extend(["--repo", repo])
+
+    log.info("mark_pr_ready", pr=pr_number, repo=repo)
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        log.warning("mark_pr_ready_timeout", pr=pr_number)
+        return False
+    except FileNotFoundError:
+        log.warning("mark_pr_ready_gh_not_found")
+        return False
+
+    if result.returncode == 0:
+        log.info("mark_pr_ready_success", pr=pr_number)
+        return True
+
+    log.warning("mark_pr_ready_failed", pr=pr_number, stderr=result.stderr[:200])
     return False

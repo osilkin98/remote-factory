@@ -18,8 +18,18 @@ logger = logging.getLogger(__name__)
 def _find_source_files(project_path: Path, language: str) -> list[Path]:
     """Find source files (excluding tests, venvs, generated code)."""
     skip_dirs = {
-        "tests", "test", ".venv", "venv", "node_modules", "__pycache__",
-        ".git", ".factory", "eval", "dist", "build", ".mypy_cache",
+        "tests",
+        "test",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".git",
+        ".factory",
+        "eval",
+        "dist",
+        "build",
+        ".mypy_cache",
     }
     ext = {
         "python": ".py",
@@ -87,13 +97,13 @@ def _analyze_file_observability(path: Path, language: str) -> dict:
 
     # Count log statements
     log_patterns = [
-        r"\blogger\.\w+\(",           # logger.info(), logger.error(), etc.
-        r"\blogging\.\w+\(",          # logging.info(), etc.
-        r"\blog\.\w+\(",              # log.info(), etc.
-        r"\bconsole\.\w+\(",          # console.log(), etc. (JS/TS)
-        r"\bprint\(",                 # print() as logging (weak signal)
-        r"\bslog\.\w+\(",            # Go slog
-        r"\btracing::\w+!",           # Rust tracing
+        r"\blogger\.\w+\(",  # logger.info(), logger.error(), etc.
+        r"\blogging\.\w+\(",  # logging.info(), etc.
+        r"\blog\.\w+\(",  # log.info(), etc.
+        r"\bconsole\.\w+\(",  # console.log(), etc. (JS/TS)
+        r"\bprint\(",  # print() as logging (weak signal)
+        r"\bslog\.\w+\(",  # Go slog
+        r"\btracing::\w+!",  # Rust tracing
     ]
     log_stmt_count = 0
     for p in log_patterns:
@@ -270,9 +280,7 @@ def _analyze_observability(project_path: Path, language: str = "python") -> dict
         )
     if gaps:
         top_gaps = gaps[:5]
-        recommendations.append(
-            f"Add logging to uninstrumented files: {', '.join(top_gaps)}"
-        )
+        recommendations.append(f"Add logging to uninstrumented files: {', '.join(top_gaps)}")
     if not recommendations:
         recommendations.append("Observability looks good — all key patterns present")
 
@@ -314,7 +322,7 @@ def _extract_backlog_bullets(content: str) -> list[str]:
             stripped = line.strip()
             m = _BULLET_PREFIX_RE.match(stripped)
             if m:
-                item_text = stripped[m.end():].strip()
+                item_text = stripped[m.end() :].strip()
                 if item_text:
                     items.append(item_text)
 
@@ -346,7 +354,7 @@ def _parse_backlog_items(project_path: Path) -> list[str]:
                 stripped = line.strip()
                 m = _BULLET_PREFIX_RE.match(stripped)
                 if m:
-                    item_text = stripped[m.end():].strip()
+                    item_text = stripped[m.end() :].strip()
                     if item_text and item_text not in seen:
                         items.append(item_text)
                         seen.add(item_text)
@@ -403,7 +411,7 @@ def remove_backlog_item(project_path: Path, item_text: str) -> bool:
         for line in content.splitlines():
             stripped = line.strip()
             m = _BULLET_PREFIX_RE.match(stripped)
-            if m and stripped[m.end():].strip() == item_text:
+            if m and stripped[m.end() :].strip() == item_text:
                 found = True
                 continue
             if stripped:
@@ -435,7 +443,7 @@ def add_backlog_item(project_path: Path, item_text: str) -> bool:
                 stripped = line.strip()
                 m = _BULLET_PREFIX_RE.match(stripped)
                 if m:
-                    existing.add(stripped[m.end():].strip())
+                    existing.add(stripped[m.end() :].strip())
         except OSError:
             pass
 
@@ -551,13 +559,69 @@ def _extract_keywords(project_path: Path) -> list[str]:
 
     # Remove common stop words and short tokens, keep meaningful words
     stop_words = {
-        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "shall", "can", "to", "of", "in", "for",
-        "on", "with", "at", "by", "from", "as", "into", "through", "and",
-        "but", "or", "nor", "not", "so", "yet", "both", "either", "neither",
-        "this", "that", "these", "those", "it", "its", "my", "your", "his",
-        "her", "our", "their", "what", "which", "who", "whom", "how",
+        "a",
+        "an",
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "may",
+        "might",
+        "shall",
+        "can",
+        "to",
+        "of",
+        "in",
+        "for",
+        "on",
+        "with",
+        "at",
+        "by",
+        "from",
+        "as",
+        "into",
+        "through",
+        "and",
+        "but",
+        "or",
+        "nor",
+        "not",
+        "so",
+        "yet",
+        "both",
+        "either",
+        "neither",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "its",
+        "my",
+        "your",
+        "his",
+        "her",
+        "our",
+        "their",
+        "what",
+        "which",
+        "who",
+        "whom",
+        "how",
     }
     words = re.findall(r"[a-zA-Z]{3,}", text.lower())
     keywords = [w for w in words if w not in stop_words]
@@ -587,9 +651,14 @@ def _search_similar_projects(project_path: Path) -> list[dict]:
     try:
         result = subprocess.run(
             [
-                "gh", "search", "repos", query,
-                "--limit", "5",
-                "--json", "fullName,url,description,stargazersCount",
+                "gh",
+                "search",
+                "repos",
+                query,
+                "--limit",
+                "5",
+                "--json",
+                "fullName,url,description,stargazersCount",
             ],
             capture_output=True,
             text=True,
@@ -644,10 +713,15 @@ def _fetch_open_issues(project_path: Path) -> list[dict]:
     try:
         result = subprocess.run(
             [
-                "gh", "issue", "list",
-                "--state", "open",
-                "--limit", "20",
-                "--json", "number,title,labels,body,author",
+                "gh",
+                "issue",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                "20",
+                "--json",
+                "number,title,labels,body,author",
             ],
             capture_output=True,
             text=True,
@@ -723,7 +797,7 @@ def _read_obsidian_notes(project_name: str) -> list[str]:
                 if content.startswith("---"):
                     end = content.find("---", 3)
                     if end != -1:
-                        content = content[end + 3:].strip()
+                        content = content[end + 3 :].strip()
                 summary = content[:200].strip()
                 if summary:
                     file_summaries.append(summary)
@@ -738,7 +812,7 @@ def _read_obsidian_notes(project_name: str) -> list[str]:
             if content.startswith("---"):
                 end = content.find("---", 3)
                 if end != -1:
-                    content = content[end + 3:].strip()
+                    content = content[end + 3 :].strip()
             summary = content[:200].strip()
             if summary:
                 file_summaries.append(summary)
@@ -754,7 +828,7 @@ def _read_obsidian_notes(project_name: str) -> list[str]:
                 if content.startswith("---"):
                     end = content.find("---", 3)
                     if end != -1:
-                        content = content[end + 3:].strip()
+                        content = content[end + 3 :].strip()
                 summary = content[:200].strip()
                 if summary:
                     file_summaries.append(summary)
@@ -766,10 +840,9 @@ def _read_obsidian_notes(project_name: str) -> list[str]:
 
 def _detect_self_improvement(project_path: Path) -> bool:
     """Return True if the target project is the factory itself."""
-    return (
-        (project_path / "factory" / "cli.py").exists()
-        and (project_path / "factory" / "insights.py").exists()
-    )
+    return (project_path / "factory" / "cli.py").exists() and (
+        project_path / "factory" / "insights.py"
+    ).exists()
 
 
 def _load_cross_project_insights(
@@ -779,10 +852,10 @@ def _load_cross_project_insights(
     """Load and format cross-project insights. Writes insights.md as side effect."""
     from factory.insights import (
         analyze,
-        discover_projects,
         format_insights,
         load_all_histories,
     )
+    from factory.registry import discover_projects
 
     project_paths = discover_projects(projects_dir)
     if not project_paths:
@@ -815,13 +888,9 @@ def _load_cross_project_insights(
     ]
 
     if insights.winning_categories:
-        summary_lines.append(
-            f"**Winning categories:** {', '.join(insights.winning_categories)}"
-        )
+        summary_lines.append(f"**Winning categories:** {', '.join(insights.winning_categories)}")
     if insights.losing_categories:
-        summary_lines.append(
-            f"**Risky categories:** {', '.join(insights.losing_categories)}"
-        )
+        summary_lines.append(f"**Risky categories:** {', '.join(insights.losing_categories)}")
     if insights.patterns:
         summary_lines.append("")
         summary_lines.append("**Patterns:**")
@@ -833,35 +902,21 @@ def _load_cross_project_insights(
     return "\n".join(summary_lines)
 
 
-def study_project_local(
-    project_path: Path, *, focus: str | None = None, **kwargs: object
-) -> str:
-    """Read interaction logs and produce an observations summary (local only)."""
-    log_files = _find_log_files(project_path)
-
-    all_messages: list[dict] = []
-    for lf in log_files:
-        all_messages.extend(_extract_messages(lf))
-
-    # Categorize
-    user_msgs = [m for m in all_messages if m["role"] == "user"]
-    errors = [m for m in all_messages if m["role"] == "error"]
-
-    lines = [
-        f"# Interaction Study — {project_path.name}",
-        "",
-    ]
-
+def _build_log_analysis_section(
+    log_files: list[Path],
+    all_messages: list[dict],
+    user_msgs: list[dict],
+    errors: list[dict],
+) -> list[str]:
+    lines: list[str] = []
     if log_files:
         lines.append(
-            f"Analyzed {len(log_files)} conversation log(s), "
-            f"{len(all_messages)} relevant messages."
+            f"Analyzed {len(log_files)} conversation log(s), {len(all_messages)} relevant messages."
         )
         lines.append("")
         lines.append(f"## User Messages ({len(user_msgs)})")
         for m in user_msgs:
             lines.append(f"- {m['text'][:200]}")
-
         lines.extend([
             "",
             f"## Errors and Issues ({len(errors)})",
@@ -870,10 +925,12 @@ def study_project_local(
             lines.append(f"- {m['text'][:200]}")
     else:
         lines.append("No interaction logs found.")
+    return lines
 
-    # Similar projects from GitHub
+
+def _build_similar_projects_section(project_path: Path) -> list[str]:
     similar = _search_similar_projects(project_path)
-    lines.extend(["", "## Similar Projects"])
+    lines = ["", "## Similar Projects"]
     if similar:
         for proj in similar:
             stars = proj.get("stars", 0)
@@ -882,8 +939,40 @@ def study_project_local(
             lines.append(f"- [{proj['name']}]({proj['url']}) ({stars} stars){desc_part}")
     else:
         lines.append("No similar projects found.")
+    return lines
 
-    # Open GitHub issues — split by ownership
+
+
+def _build_spec_section(project_path: Path) -> list[str]:
+    from factory.discovery.spec import resolve_spec
+
+    spec_path = resolve_spec(project_path)
+    lines = ["", "## SPEC"]
+    if spec_path is not None:
+        lines.append(
+            "SPEC.md found at project root. "
+            "The Strategist SHOULD use SPEC Diff for plan traceability."
+        )
+    else:
+        lines.append("No SPEC.md found. Run 'factory spec generate <path>' to generate one.")
+    if spec_path is not None:
+        try:
+            spec_lines = [
+                ln
+                for ln in spec_path.read_text().splitlines()
+                if ln.strip() and not ln.strip().startswith("# ")
+            ]
+            if spec_lines:
+                lines.append("")
+                lines.append("**Spec summary:**")
+                for sl in spec_lines:
+                    lines.append(f"  {sl}")
+        except OSError:
+            pass
+    return lines
+
+
+def _build_github_issues_section(project_path: Path) -> list[str]:
     open_issues = _fetch_open_issues(project_path)
     gh_user = _get_github_user()
 
@@ -897,75 +986,78 @@ def study_project_local(
             if issue["labels"]:
                 label_str = f" [{', '.join(issue['labels'])}]"
             author_str = f" (by @{issue['author']})" if issue["author"] else ""
-            out.append(
-                f"- **#{issue['number']}** {issue['title']}{label_str}{author_str}"
-            )
+            out.append(f"- **#{issue['number']}** {issue['title']}{label_str}{author_str}")
             if issue["body"]:
                 body_preview = issue["body"].replace("\n", " ").strip()
                 if body_preview:
                     out.append(f"  > {body_preview}")
         return out
 
-    lines.extend(["", "## Open GitHub Issues"])
+    lines = ["", "## Open GitHub Issues"]
     if not open_issues:
         lines.append("No open issues found (or not a GitHub repo).")
     else:
         if own_issues:
-            lines.extend([
-                "",
-                f"### Your Issues ({len(own_issues)}) — actionable, may generate fix hypotheses",
-                "",
-            ])
+            lines.extend(
+                [
+                    "",
+                    f"### Your Issues ({len(own_issues)}) — actionable, may generate fix hypotheses",
+                    "",
+                ]
+            )
             lines.extend(_format_issue_list(own_issues))
 
         if community_issues:
-            lines.extend([
-                "",
-                f"### Community Issues ({len(community_issues)}) — reference only, do NOT auto-fix",
-                "",
-                "These were filed by external contributors. Do not generate hypotheses for them "
-                "unless explicitly targeted via --focus. If valuable, suggest the author creates a PR.",
-                "",
-            ])
+            lines.extend(
+                [
+                    "",
+                    f"### Community Issues ({len(community_issues)}) — reference only, do NOT auto-fix",
+                    "",
+                    "These were filed by external contributors. Do not generate hypotheses for them "
+                    "unless explicitly targeted via --focus. If valuable, suggest the author creates a PR.",
+                    "",
+                ]
+            )
             lines.extend(_format_issue_list(community_issues))
 
         if not own_issues and not community_issues:
             lines.append("No open issues found (or not a GitHub repo).")
+    return lines
 
-    # Backlog — unified queue of features/items to build
+
+def _build_backlog_section(
+    project_path: Path, focus: str | None, backlog_items: list[str],
+) -> list[str]:
     _migrate_legacy_backlog(project_path)
-    backlog_items = _parse_backlog_items(project_path)
-    if backlog_items:
-        _persist_backlog_items(project_path, backlog_items)
+    items = backlog_items or _parse_backlog_items(project_path)
+    if items:
+        _persist_backlog_items(project_path, items)
 
-    lines.extend([
-        "",
-        "## Backlog",
-        "",
-    ])
+    lines = ["", "## Backlog", ""]
     if focus:
-        lines.append(
-            f"**TARGETED MODE** — building exactly one item: {focus}",
-        )
+        lines.append(f"**TARGETED MODE** — building exactly one item: {focus}")
         lines.append("")
         lines.append(f"- {focus}")
-    elif backlog_items:
+    elif items:
         lines.append(
-            f"**{len(backlog_items)} items** in the backlog. "
+            f"**{len(items)} items** in the backlog. "
             "Clear as many as possible this cycle.",
         )
         lines.append("")
-        for item in backlog_items:
+        for item in items:
             lines.append(f"- {item}")
     else:
         lines.append("Backlog is empty. Focus on new improvements and hygiene.")
+    return lines
 
-    # Observability coverage analysis
+
+def _build_observability_section(project_path: Path) -> list[str]:
     from factory.discovery.introspect import _detect_language
+
     language = _detect_language(project_path)
     obs = _analyze_observability(project_path, language)
 
-    lines.extend(["", "## Observability Coverage"])
+    lines = ["", "## Observability Coverage"]
     lines.append(f"- **Score:** {obs['observability_score']:.1%}")
     lines.append(
         f"- **Function coverage:** {obs['logged_functions']}/{obs['total_functions']} "
@@ -986,25 +1078,34 @@ def study_project_local(
         lines.extend(["", "### Observability Recommendations"])
         for rec in obs["recommendations"]:
             lines.append(f"- {rec}")
+    return lines
 
-    # Prior knowledge from Obsidian vault
+
+def _build_prior_knowledge_section(project_path: Path) -> list[str]:
     project_name = project_path.name
     notes = _read_obsidian_notes(project_name)
-    lines.extend(["", "## Prior Knowledge (Obsidian)"])
+    lines = ["", "## Prior Knowledge (Obsidian)"]
     if notes:
         for note in notes:
             lines.append(f"- {note}")
     else:
         lines.append("No prior notes found.")
+    return lines
 
-    # Cross-project insights
-    projects_dir = kwargs.get("projects_dir")
+
+def _build_cross_project_insights_section(
+    project_path: Path, projects_dir: Path | None,
+) -> list[str]:
+    lines: list[str] = []
     if projects_dir:
-        insights_text = _load_cross_project_insights(project_path, Path(str(projects_dir)))
+        insights_text = _load_cross_project_insights(project_path, projects_dir)
         if insights_text:
             lines.extend(["", insights_text])
+    return lines
 
-    # Self-improvement context
+
+def _build_self_improvement_section(project_path: Path) -> list[str]:
+    lines: list[str] = []
     if _detect_self_improvement(project_path):
         lines.extend([
             "",
@@ -1027,29 +1128,31 @@ def study_project_local(
             "",
             "Prioritize: Self-evolution, Prompt engineering, Knowledge management.",
         ])
+    return lines
 
-    # Hypothesis budget — backlog-first (overridden in targeted mode)
-    lines.extend([
-        "",
-        "## Hypothesis Budget",
-        "",
-    ])
+
+def _build_hypothesis_budget_section(
+    project_path: Path, focus: str | None, backlog_items: list[str],
+) -> list[str]:
+    lines = ["", "## Hypothesis Budget", ""]
 
     if focus:
-        lines.extend([
-            "**TARGETED MODE — single-item budget**",
-            "",
-            "**Backlog items: 1** (the focus target only)",
-            "**New items: at most 0** (do not add new items)",
-            "**Growth minimum: 0** (growth constraints suspended for targeted mode)",
-            "",
-            "### Rules",
-            "",
-            "- Generate exactly ONE hypothesis for the focus target.",
-            "- Do NOT clear other backlog items this cycle.",
-            "- Do NOT add new items.",
-            "- FEEC category still applies for classifying the single hypothesis.",
-        ])
+        lines.extend(
+            [
+                "**TARGETED MODE — single-item budget**",
+                "",
+                "**Backlog items: 1** (the focus target only)",
+                "**New items: at most 0** (do not add new items)",
+                "**Growth minimum: 0** (growth constraints suspended for targeted mode)",
+                "",
+                "### Rules",
+                "",
+                "- Generate exactly ONE hypothesis for the focus target.",
+                "- Do NOT clear other backlog items this cycle.",
+                "- Do NOT add new items.",
+                "- FEEC category still applies for classifying the single hypothesis.",
+            ]
+        )
     else:
         from factory.models import HypothesisBudget
 
@@ -1057,6 +1160,7 @@ def study_project_local(
         config_path = project_path / ".factory" / "config.json"
         if config_path.exists():
             import json as _json
+
             try:
                 cfg = _json.loads(config_path.read_text())
                 if "hypothesis_budget" in cfg:
@@ -1086,12 +1190,48 @@ def study_project_local(
             "*Budget is configurable: set `min_growth`, `max_new` in factory.md under `## Hypothesis Budget`, "
             "or pass `--min-growth`, `--max-new` on the CLI.*",
         ])
+    return lines
+
+
+def study_project_local(
+    project_path: Path, *, focus: str | None = None, **kwargs: object
+) -> str:
+    """Read interaction logs and produce an observations summary (local only)."""
+    log_files = _find_log_files(project_path)
+
+    all_messages: list[dict] = []
+    for lf in log_files:
+        all_messages.extend(_extract_messages(lf))
+
+    user_msgs = [m for m in all_messages if m["role"] == "user"]
+    errors = [m for m in all_messages if m["role"] == "error"]
+
+    backlog_items = _parse_backlog_items(project_path)
+    projects_dir = kwargs.get("projects_dir")
+    projects_dir_path = Path(str(projects_dir)) if projects_dir else None
+
+    lines = [f"# Interaction Study — {project_path.name}", ""]
+
+    lines.extend(_build_log_analysis_section(log_files, all_messages, user_msgs, errors))
+    lines.extend(_build_similar_projects_section(project_path))
+    lines.extend(_build_spec_section(project_path))
+    lines.extend(_build_github_issues_section(project_path))
+    lines.extend(_build_backlog_section(project_path, focus, backlog_items))
+    lines.extend(_build_observability_section(project_path))
+    lines.extend(_build_prior_knowledge_section(project_path))
+    lines.extend(_build_cross_project_insights_section(project_path, projects_dir_path))
+    lines.extend(_build_self_improvement_section(project_path))
+    lines.extend(_build_hypothesis_budget_section(project_path, focus, backlog_items))
+
+    from factory.mempalace.reader import mp_read as _mp_read
+
+    mp_context = _mp_read(project_path, task_hint=focus)
+    if mp_context:
+        lines.extend(["", "## Memory Context (MemPalace)", "", mp_context])
 
     return "\n".join(lines)
 
 
-def study_project(
-    project_path: Path, *, focus: str | None = None, **kwargs: object
-) -> str:
+def study_project(project_path: Path, *, focus: str | None = None, **kwargs: object) -> str:
     """Study a project — local analysis. Deep research available via researcher subagent."""
     return study_project_local(project_path, focus=focus, **kwargs)

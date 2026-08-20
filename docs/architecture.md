@@ -1,8 +1,8 @@
 # Architecture
 
-re:factory is a three-layer system with strict separation between tooling, orchestration, and execution.
+re:factory is a four-layer system with strict separation between tooling, orchestration, execution, and extensibility.
 
-## Three Layers
+## Four Layers
 
 ### Layer 1: Python CLI (`factory/`)
 
@@ -38,11 +38,20 @@ Nine specialist Claude Code subprocesses, each with a narrow responsibility:
 | **Refiner** | Classify and scope post-cycle refinement requests (T1/T2/T3 tiers) | `factory agent refiner --task "..."` |
 | **Failure Analyst** | Classify run failures by root cause (research mode only) | `factory agent failure_analyst --task "..."` |
 
-Agent prompts are resolved via two-tier lookup in `factory/agents/runner.py`:
+Agent prompts are resolved via three-tier lookup in `factory/agents/runner.py`:
 1. Project-specific override: `<project>/.factory/agents/<role>.md`
-2. re:factory default: `factory/agents/prompts/<role>.md`
+2. User-global override: `~/.factory/agents/prompts/<role>.md`
+3. re:factory default: `factory/agents/prompts/<role>.md`
 
 Evolved playbooks from ACE are auto-injected at runtime.
+
+### Layer 4: Plugin System
+
+re:factory is an **engine** — the built-in modes are one configuration of it. Pip-installable plugins can extend the factory with new CEO modes, CLI commands, agent roles, pre-dispatch hooks, parser extensions, and workflow search paths via standard Python entry points (`factory.plugins` group).
+
+The plugin registry (`factory/plugins.py`) loads at parser construction time with three-tier error isolation. Collision protection ensures builtins always win and first-registered plugins take priority.
+
+See [Plugins — Build Your Own Factory](plugins.md) for the full guide.
 
 ## State Machine
 
@@ -125,6 +134,26 @@ Key differences from Improve mode:
 6. Archivist records    → .factory/archive/ notes, performance report
 ```
 
+### Adversarial Pipeline
+
+For projects with an `## Adversarial` section in `factory.md`, re:factory alternates between optimizing two competing components (generator and discriminator):
+
+```
+1. Check active phase  → load .factory/adversarial_state.json
+2. Run active eval     → generator or discriminator eval_command
+3. Record result       → update streak counters, check hysteresis
+4. Phase switch?       → if consecutive_above >= hysteresis, flip active role
+5. Convergence?        → if both per-role streaks >= convergence_window, mark converged
+6. Save state          → persist to .factory/adversarial_state.json
+```
+
+Key properties:
+- **Hysteresis** prevents oscillation — N consecutive above-threshold rounds required before switching (default 3)
+- **Per-role streak counters freeze** when that role is inactive — only the active role's counter changes
+- **Convergence** requires both sides to independently sustain above-threshold performance
+
+State management: `factory/adversarial.py`. Configuration: [Adversarial](configuration.md#adversarial).
+
 ### Eval Pipeline
 
 ```
@@ -188,7 +217,9 @@ Stuck detection activates after 3+ consecutive same-category reverts, forcing ca
 | `factory/analysis.py` | Experiment comparison (diff, explain) |
 | `factory/registry.py` | Global project registry (`~/.factory/registry.json`) |
 | `factory/report.py` | Performance report generation and loading |
+| `factory/adversarial.py` | GAN-style adversarial eval loop state machine |
 | `factory/agents/runner.py` | Agent subprocess spawner + event emission |
+| `factory/plugins.py` | Plugin registry — entry point discovery + extension surfaces |
 
 ## `.factory/` Directory
 
@@ -216,6 +247,7 @@ Generated at runtime — not checked into version control:
 ├── reviews/
 │   ├── <role>-latest.md
 │   └── ceo-verdict-<role>.md
+├── adversarial_state.json   # Adversarial loop state (phase, streaks, history)
 ├── archive/                 # Archivist notes (institutional memory)
 │   ├── experiments/         # Per-experiment notes
 │   ├── strategies/          # Strategy snapshots
@@ -237,6 +269,7 @@ Generated at runtime — not checked into version control:
 
 ## Related Docs
 
+- [Plugins — Build Your Own Factory](plugins.md) — How to extend re:factory with custom modes, agents, and commands
 - [Self-Improvement Loop](self-improvement.md) — How the CEO tracks agents, cross-project learning, and autonomous playbook evolution
 - [ACE Playbook Evolution](ace.md) — The Reflect → Curate → Inject playbook evolution mechanics
 - [Eval System](eval.md) — Three-tier scoring, guards, and precheck gates

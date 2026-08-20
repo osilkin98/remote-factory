@@ -1,14 +1,11 @@
-"""Runner abstraction layer for CLI backends (claude, bob, etc.)."""
+"""Runner abstraction layer for CLI backends."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 from factory.runners._stream import should_stream, stream_subprocess
-from factory.runners.bob import BobRunner, is_dry_run
 from factory.runners.claude import ClaudeRunner
-from factory.runners.codex import CodexRunner, is_codex_dry_run
-from factory.runners.opencode import OpenCodeRunner, is_opencode_dry_run
 from factory.runners.protocol import Runner, RunnerMeta
 
 import structlog
@@ -19,24 +16,15 @@ __all__ = [
     "Runner",
     "RunnerMeta",
     "ClaudeRunner",
-    "BobRunner",
-    "CodexRunner",
-    "OpenCodeRunner",
     "get_runner",
     "get_available_runners",
     "get_runner_choices",
-    "is_dry_run",
-    "is_codex_dry_run",
-    "is_opencode_dry_run",
     "should_stream",
     "stream_subprocess",
 ]
 
 _RUNNERS: dict[str, type[Runner]] = {
     "claude": ClaudeRunner,  # type: ignore[dict-item]
-    "bob": BobRunner,  # type: ignore[dict-item]
-    "codex": CodexRunner,  # type: ignore[dict-item]
-    "opencode": OpenCodeRunner,  # type: ignore[dict-item]
 }
 
 
@@ -58,15 +46,15 @@ def get_runner(name: str | None = None, project_path: Path | None = None) -> Run
 
     _load_entrypoint_runners()
 
-    resolved = resolve("runner", cli_value=name, env_var="FACTORY_RUNNER", default="claude") or "claude"
+    resolved = (
+        resolve("runner", cli_value=name, env_var="FACTORY_RUNNER", default="claude") or "claude"
+    )
     resolved = resolved.lower().strip()
 
     if resolved not in _RUNNERS:
         available = ", ".join(_RUNNERS.keys())
         raise ValueError(f"Unknown runner '{resolved}'. Available: {available}")
 
-    if resolved == "bob":
-        return BobRunner(project_path=project_path)
     return _RUNNERS[resolved]()
 
 
@@ -84,11 +72,6 @@ def get_all_runner_meta() -> list[RunnerMeta]:
         except (AttributeError, TypeError):
             pass
     return result
-
-
-def register_runner(name: str, runner_class: type[Runner]) -> None:
-    """Register a runner implementation."""
-    _RUNNERS[name] = runner_class
 
 
 _entrypoints_loaded = False
